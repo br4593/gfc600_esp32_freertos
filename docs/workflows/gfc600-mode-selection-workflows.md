@@ -4,6 +4,40 @@ This workflow converts Garmin GFC 600 behavior into practical steps for the MSFS
 
 Primary source: Garmin `GFC 600 Automatic Flight Control System (with Color Display) Pilot's Guide`, `190-03090-00 Rev. A`, January 2024.
 
+Detailed FD/AP-off behavior and confidence notes:
+
+- [GFC 600 Mode-Key Behavior With FD And AP Off](../research/gfc600-mode-key-behavior-fd-ap-off.md)
+
+## Workflow 0: Mode Key With FD And AP Off
+
+```mermaid
+flowchart TD
+    Press[Mode key pressed] --> Valid{Mode selection valid?}
+    Valid -->|no| Reject[Keep FD, AP, and modes unchanged]
+    Valid -->|yes| EnableFD[Enable FD]
+    EnableFD --> Axis{Selected mode axis}
+    Axis -->|lateral| Lat[Set selected lateral mode]
+    Axis -->|vertical| Vert[Set selected vertical mode]
+    Axis -->|coupled| Coupled[Set both axes]
+    Lat --> PIT[Set vertical PIT if none]
+    Vert --> ROL[Set lateral ROL if none]
+    Coupled --> Special{Special coupled mode}
+    Special -->|LVL| EngageAP[Engage AP]
+    Special -->|GA| KeepAPOff[Keep AP off]
+```
+
+Project behavior:
+
+- `AP_ON` with `FD_OFF` is not a valid normal state.
+- A successful ordinary mode selection while FD is off enables FD, but does not
+  engage AP.
+- Lateral selections use `PIT` as the default vertical mode.
+- Vertical selections use `ROL` as the default lateral mode.
+- `LVL` engages AP and selects `LVL` on both axes.
+- `GA` selects `GA` on both axes but does not engage AP from an off state.
+- Invalid `NAV`, `APR`, `BC`, or `VNV` requests do not change FD, AP, or mode
+  state.
+
 ## Workflow 1: AP/FD Engagement
 
 ```mermaid
@@ -29,6 +63,7 @@ Project behavior:
 2. On AP from FD off: FD on, AP on, active `PIT`/`ROL`.
 3. On AP from FD on: AP on, preserve existing modes.
 4. If selected-altitude capture exists, arm `ALTS` for compatible vertical modes.
+5. Prevent or correct the invalid runtime combination `AP_ON` with `FD_OFF`.
 
 ## Workflow 2: Vertical Mode Button
 

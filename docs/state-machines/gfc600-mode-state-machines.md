@@ -33,6 +33,9 @@ stateDiagram-v2
 
     Ready --> FD_On_Default: FD pressed
     Ready --> AP_On_Default: AP pressed and FD off
+    Ready --> FD_On_SelectedMode: valid ordinary mode key pressed
+    Ready --> AP_On_LVL: LVL pressed
+    Ready --> FD_On_GA: GA pressed
     FD_On_Default --> AP_On_FollowFD: AP pressed
 
     state FD_On_Default {
@@ -47,6 +50,24 @@ stateDiagram-v2
         AP_PIT_ROL: AP engaged
         AP_PIT_ROL: FD active PIT/ROL
     }
+
+    state FD_On_SelectedMode {
+        [*] --> SelectedAxis
+        SelectedAxis: selected mode active or armed
+        SelectedAxis: other axis uses PIT or ROL default
+    }
+
+    state AP_On_LVL {
+        [*] --> AP_LVL_LVL
+        AP_LVL_LVL: AP and FD active
+        AP_LVL_LVL: active vertical/lateral LVL
+    }
+
+    state FD_On_GA {
+        [*] --> FD_GA_GA
+        FD_GA_GA: FD active, AP remains off
+        FD_GA_GA: active vertical/lateral GA
+    }
 ```
 
 Implementation notes:
@@ -54,6 +75,16 @@ Implementation notes:
 - If AP is pressed while FD is off, set FD on and initialize `PIT`/`ROL`.
 - If FD is already on, AP engagement should not change the active modes.
 - If YD exists and should auto-engage with AP in the chosen simulated installation, model that as configuration.
+- `AP_ON` with `FD_OFF` is not a valid normal runtime combination.
+- A successful ordinary lateral mode selection while FD is off enables FD and
+  uses `PIT` as the default vertical mode.
+- A successful ordinary vertical mode selection while FD is off enables FD and
+  uses `ROL` as the default lateral mode.
+- Invalid `NAV`, `APR`, `BC`, or `VNV` requests should not enable FD or change
+  the current mode state.
+- The GFC 600 guide does not provide a complete mode-key activation table.
+  See [GFC 600 Mode-Key Behavior With FD And AP Off](../research/gfc600-mode-key-behavior-fd-ap-off.md)
+  for the confirmed facts and project inference.
 
 ## Vertical Mode State Machine
 

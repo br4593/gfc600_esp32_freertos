@@ -43,6 +43,11 @@ Secondary cross-check:
 - If AP is pressed while FD is off, FD turns on with default `PIT` and `ROL` modes.
 - Pressing FD activates the Flight Director, but not necessarily the autopilot servos.
 - Manual AP disconnect causes aural alerting and yellow AP flashing for about 5 seconds.
+- `AP_ON` with `FD_OFF` is not a valid normal state because AP follows FD commands.
+- The GFC 600 guide does not explicitly tabulate every ordinary mode-key press
+  with FD off. For this project, a valid ordinary mode selection enables FD in
+  the selected mode and uses the default mode on the other axis. See
+  [GFC 600 Mode-Key Behavior With FD And AP Off](gfc600-mode-key-behavior-fd-ap-off.md).
 
 ### Vertical Modes
 

@@ -24,7 +24,7 @@
 - We will use ESP32 preferbly with dual core
 - We will use OLED Display with SPI
 - We will use a custom PCB I built for it
-
+- Save a state of the work in project status file
 
 ## Skills
 

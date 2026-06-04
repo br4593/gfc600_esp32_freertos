@@ -31,6 +31,21 @@ Record for every test:
 | AP on from FD on | Press `AP` after selecting modes | `AP` on, previous active FD modes preserved. |
 | AP manual disconnect | Press AP disconnect | `AP` flashes attention state for about 5 sec, then off. |
 | YD engagement | Press `YD` if configured | `YD` displayed steady active. |
+| Invalid AP/FD combination | Force or receive AP on with FD off | State manager corrects to FD on or rejects the update. |
+
+## Mode-Key Activation Tests
+
+| Test | Setup | Action | Expected Display / State |
+|---|---|---|---|
+| HDG activates FD | FD off, AP off | Press `HDG` | FD on, AP off, `HDG` active, `PIT` active. |
+| VS activates FD | FD off, AP off | Press `VS` | FD on, AP off, `ROL` active, `VS` active. |
+| ALT activates FD | FD off, AP off | Press `ALT` | FD on, AP off, `ROL` active, `ALT` active. |
+| Valid GPS NAV activates FD | FD off, AP off, valid GPS course | Press `NAV` | FD on, AP off, `GPS` active or armed, `PIT` active. |
+| Invalid NAV does not activate FD | FD off, AP off, no valid nav source | Press `NAV` | No state change; diagnostic recorded. |
+| LVL engages AP | FD off, AP off | Press `LVL` | FD on, AP on, `LVL` active on both axes. |
+| GA does not engage AP | FD off, AP off | Press `GA` | FD on, AP off, `GA` active on both axes. |
+| Active HDG deselection | FD on, AP off, `HDG` active | Press `HDG` | `ROL` active, AP remains off. |
+| FD key disabled with AP | FD on, AP on | Press `FD` | No state change. |
 
 ## Vertical Mode Tests
 
