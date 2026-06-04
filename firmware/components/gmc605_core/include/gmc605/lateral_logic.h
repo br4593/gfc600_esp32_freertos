@@ -4,4 +4,4 @@
 #include "modes.h"
 
 
-void lateral_logic_handle_event(gmc605_state_t* state, gmc605_event_t* event);
+void gmc605_lateral_handle_event(gmc605_state_t* state, gmc605_event_t* event);

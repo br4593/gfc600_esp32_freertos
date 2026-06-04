@@ -42,7 +42,7 @@ typedef struct {
     gmc605_event_type_t type;
 
     union {
-        gmc605_nav_source_t nav_source;
+        nav_source_t nav_source;
         uint16_t selected_heading_deg;
         int32_t selected_altitude_ft;
         int32_t selected_vs_fpm;

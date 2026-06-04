@@ -6,6 +6,13 @@ Identify which Microsoft Flight Simulator variables and events should be used by
 
 This document is simulator-only. It does not describe certified avionics behavior.
 
+Related documents:
+
+- [GFC 600 Mode Logic](../state-machines/gfc600-mode-logic.md) defines the
+  local Garmin-style state and transition rules.
+- [GMC 605 Firmware Architecture](../design-decisions/gmc605-firmware-architecture.md)
+  defines the ESP32 and host-bridge ownership split.
+
 ## Sources Used
 
 Primary official sources:

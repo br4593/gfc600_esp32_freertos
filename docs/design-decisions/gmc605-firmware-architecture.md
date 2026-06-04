@@ -11,6 +11,15 @@ Known hardware direction:
 - MSFS link: host-side SimConnect bridge, most likely over USB CDC serial first.
 - Project boundary: simulator-only panel, not real aircraft avionics.
 
+Related documents:
+
+- [GFC 600 Mode Logic](../state-machines/gfc600-mode-logic.md) owns mode states
+  and transitions.
+- [MSFS SimVar And Event Map](../research/msfs-gmc605-simvar-event-map.md) owns
+  simulator variable and event mapping.
+- [GMC 605 Display And ESP32 Selection](gmc605-display-and-esp32-selection.md)
+  owns hardware and SSD1322 driver decisions.
+
 ## Architecture Decision
 
 Use an event-driven firmware with one owner per hardware resource.
@@ -123,11 +132,15 @@ The state manager should be the only writer for:
 - active lateral mode
 - armed lateral mode
 - active vertical mode
-- armed vertical mode
+- armed vertical mode set
+- suspended protection restore modes
 - AP/FD/YD displayed state
 - selected references copied into the display model
 - alert timers and flash timers
 - host command intent
+
+It must also preserve semantic NAV/APR ownership even when both states render as
+the same `GPS` or `LOC` label.
 
 The state manager should receive:
 
@@ -167,6 +180,31 @@ display_renderer
 
 This keeps Garmin-style logic out of the SSD1322 driver.
 
+The state manager decides what labels exist. The display model resolves slot,
+priority, effect, and expiry metadata. The renderer only converts that snapshot
+into pixels.
+
+### Monochrome Style Mapping
+
+| Garmin Style | SSD1322 Substitute |
+|---|---|
+| Green active | Bright steady text |
+| White armed | Dimmer or smaller steady text |
+| Yellow attention | Flashing text or inverse video |
+| Red failure | Fast flashing inverse video |
+| New capture flash | Bright or inverse flash with timeout |
+
+### Display Priority
+
+When space is limited, render in this order:
+
+1. Failures and abnormal AP/YD states.
+2. Manual disconnect alerts.
+3. Active lateral and vertical modes.
+4. Armed lateral and vertical modes.
+5. References.
+6. Advisory messages.
+
 ## Display Slots
 
 Suggested first SSD1322 layout:
@@ -190,6 +228,10 @@ Suggested slot names:
 | `display_slot_vert_armed` | `ALTS`, `GP`, `GS`, `VPTH` |
 | `display_slot_reference` | `5500`, `+500`, `120KT` |
 
+The active and armed label conditions are defined in
+[GFC 600 Mode Logic](../state-machines/gfc600-mode-logic.md). Do not duplicate
+that trigger table in the renderer.
+
 ## Flashing And Alerts
 
 Store flashing as display metadata:
@@ -203,26 +245,14 @@ Store flashing as display metadata:
 
 The display task calculates the current visible/inverse phase from `esp_timer_get_time()` or a periodic tick. The state manager only sets the effect.
 
-## SSD1322 Driver Strategy
+## SSD1322 Driver Boundary
 
-Recommended first integration:
+The display task owns the SSD1322 device and framebuffer. No other task may
+call the driver directly. Keep the renderer API independent of U8g2 or any
+future native SSD1322 driver.
 
-1. Try U8g2 as an ESP-IDF component.
-2. Wrap it behind `display_renderer`.
-3. Verify exact module mapping and orientation.
-4. Keep the dependency only if it is stable and simple.
-
-Recommended fallback:
-
-1. Write a small SSD1322-only driver.
-2. Keep an 8 KB 4-bit framebuffer.
-3. Implement only the drawing primitives we need:
-   - clear
-   - draw bitmap font glyph
-   - draw inverse rectangle
-   - draw horizontal/vertical line
-   - present full framebuffer
-4. Keep the same `display_renderer` API.
+The driver choice, U8g2 constructors, and fallback plan are recorded only in
+[GMC 605 Display And ESP32 Selection](gmc605-display-and-esp32-selection.md).
 
 ## Host Link Protocol
 
@@ -264,6 +294,18 @@ Possible ESP32-S3 split:
 
 If USB CDC only is used and no Wi-Fi is active, core pinning may not matter at first.
 
+## First Hardware Pin Planning
+
+Reserve these groups before locking the PCB profile:
+
+| Function | Pins Needed |
+|---|---:|
+| SSD1322 SPI | SCLK, MOSI, CS, DC, RESET, optional display power enable |
+| Encoders | Two pins per encoder, plus push pins if used |
+| Buttons | Direct GPIO or row/column matrix |
+| Host link | Native USB CDC preferred for development |
+| Debug | USB serial/JTAG and one spare GPIO LED |
+
 ## Error Handling
 
 Firmware should handle:
@@ -281,6 +323,13 @@ Display behavior:
 - If host link is lost, keep local panel responsive but show `LINK`.
 - If MSFS is disconnected, show `SIM`.
 - If display init fails, log error and keep input/link tasks alive for diagnostics.
+
+Project risks:
+
+- Generic MSFS variables may not expose Garmin-style capture logic cleanly.
+- Some aircraft require custom Input Events or LVars/HVars.
+- A bare SSD1322 panel may not accept 3.3 V logic directly.
+- Logging or link processing must never block input, state, or display work.
 
 ## Testing Strategy
 
