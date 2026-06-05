@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gmc605-msfs-connector"
+version = "0.1.0"
+description = "MSFS and debug UART connector for the GMC 605 ESP32 panel"
+requires-python = ">=3.10"
+dependencies = [
+    "pyserial>=3.5",
+]
+
+[project.optional-dependencies]
+msfs = [
+    "SimConnect>=0.4.26",
+]
+
+[project.scripts]
+gmc605-connector = "gmc605_connector.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+

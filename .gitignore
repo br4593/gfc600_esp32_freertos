@@ -1,0 +1,10 @@
+.edge-headless*/
+web-ui*.log
+web-ui*.err.log
+
+__pycache__/
+.pytest_cache/
+*.pyc
+
+firmware/build/
+sdkconfig

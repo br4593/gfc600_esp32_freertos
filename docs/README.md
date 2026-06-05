@@ -1,27 +1,44 @@
 # Project Documentation
 
-This project is an MSFS-only GMC 605 / GFC 600-style simulator panel. The
-documents are intentionally split by ownership so the same behavior is not
-described in several places.
+This is an MSFS-only Garmin GMC 605 / GFC 600-style simulator panel.
 
-## Core Documents
+The new project rule is simple:
 
-| Document | Owns |
+- MSFS owns autopilot behavior.
+- The Python connector talks to MSFS through SimConnect.
+- The ESP32 shows the latest connector snapshot on the OLED.
+- The ESP32 sends button and encoder commands back to the connector.
+- The ESP32 does not implement autopilot mode logic.
+
+## Current Core Documents
+
+| Document | Purpose |
 |---|---|
-| [GFC 600 Mode Logic](state-machines/gfc600-mode-logic.md) | Mode states, button behavior, active/armed transitions, capture, deselection, reversion, and protection logic |
-| [GFC 600 Mode Logic Test Plan](test-plans/gfc600-mode-logic-test-plan.md) | Expected test scenarios and pass criteria |
-| [MSFS SimVar And Event Map](research/msfs-gmc605-simvar-event-map.md) | Simulator variables, events, confidence, and aircraft-adapter concerns |
-| [GMC 605 Firmware Architecture](design-decisions/gmc605-firmware-architecture.md) | ESP-IDF tasks, modules, data flow, display model, host protocol, and bring-up order |
-| [GMC 605 Display And ESP32 Selection](design-decisions/gmc605-display-and-esp32-selection.md) | ESP32, display, SSD1322 driver, and hardware decisions |
+| [Firmware Architecture](design-decisions/gmc605-firmware-architecture.md) | ESP32 display/input firmware shape and task ownership. |
+| [MSFS Connector Web GUI](design-decisions/msfs-connector-web-gui.md) | Planned browser GUI for the Python connector. |
+| [MSFS SimVar And Event Map](research/msfs-gmc605-simvar-event-map.md) | Minimal SimConnect reads, events, and adapter rules. |
+| [Display Annunciation Model](state-machines/gfc600-mode-logic.md) | Display labels and snapshot fields, not firmware-owned AP logic. |
+| [Display And ESP32 Selection](design-decisions/gmc605-display-and-esp32-selection.md) | Hardware/display decision for the simulator panel. |
+| [Panel Integration Test Plan](test-plans/gfc600-mode-logic-test-plan.md) | Tests for connector, ESP32 display, and command flow. |
+| [MSFS Connector README](../msfs_connector/README.md) | Existing Python connector notes and runnable details. |
 
 ## Editing Rules
 
-- Add mode behavior only to the mode-logic document.
-- Add a test when a mode rule is added or changed.
-- Add MSFS-specific mapping only to the SimVar/event map.
-- Add task, module, protocol, or renderer decisions only to firmware
-  architecture.
-- Add hardware or display-driver decisions only to the hardware selection
-  document.
-- Do not create a new document for one mode, one button, or one workflow unless
-  it cannot fit one of the owners above.
+- Keep firmware docs about ESP32 inputs, display, link health, and rendering.
+- Keep SimConnect details in the SimVar/event map.
+- Keep connector UI decisions in the web GUI document.
+- Keep display label decisions in the annunciation model.
+- Do not add Garmin-style transition engines to ESP32 documentation.
+- Do not describe this as real aircraft avionics.
+
+## First Restart Target
+
+Build a working loop before adding polish:
+
+1. Python connector reads MSFS state.
+2. Python connector sends a compact snapshot to ESP32.
+3. ESP32 displays AP/FD/YD key LEDs, lateral/vertical LCD labels, references,
+   and link status.
+4. ESP32 sends button/encoder commands to Python.
+5. Python sends SimConnect events to MSFS.
+6. Python reads back the result and sends the next snapshot.

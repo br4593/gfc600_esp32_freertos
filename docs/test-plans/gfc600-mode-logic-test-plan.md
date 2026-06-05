@@ -1,141 +1,123 @@
-# GFC 600 Mode Logic Test Plan
+# Panel Integration Test Plan
 
-Purpose: validate the ESP32/MSFS annunciation model against expected GFC 600-style behavior.
+## Goal
 
-Primary source: Garmin `GFC 600 Automatic Flight Control System (with Color Display) Pilot's Guide`, `190-03090-00 Rev. A`, January 2024.
+Validate the restarted system:
 
-Simulator boundary: tests verify a simulator panel and display model only.
+- Python connector reads MSFS.
+- ESP32 displays connector snapshots.
+- ESP32 sends button/encoder commands.
+- Python connector sends commands to MSFS.
+- MSFS state comes back and updates the display.
 
-Expected transitions are defined in
-[GFC 600 Mode Logic](../state-machines/gfc600-mode-logic.md).
+This is a simulator-only test plan.
 
-## Test Setup
+## Sources Used
 
-Record for every test:
+- User restart instruction.
+- Garmin `GFC 600 Pilot's Guide`, `190-01488-00 Rev. H`.
+- [Firmware Architecture](../design-decisions/gmc605-firmware-architecture.md)
+- [MSFS SimVar And Event Map](../research/msfs-gmc605-simvar-event-map.md)
+- [Display Annunciation Model](../state-machines/gfc600-mode-logic.md)
 
-- MSFS aircraft.
-- Autopilot implementation used by that aircraft.
-- Nav source: GPS, VOR, LOC.
-- Selected altitude.
-- Current altitude.
-- CDI/VDEV if available.
-- Button pressed.
-- Expected OLED labels.
-- Actual OLED labels.
-- MSFS AP behavior.
+## Test Setup Record
 
-## Core Display Tests
+Record this for each test run:
 
-| Test | Action | Expected Display |
+| Field | Value |
+|---|---|
+| Date/time | |
+| MSFS version | |
+| Aircraft | |
+| Connector profile | |
+| ESP32 board | |
+| Display module | |
+| Link type | USB CDC / UART / Wi-Fi |
+| Snapshot rate | |
+| Notes | |
+
+## Phase 1: Connector Without ESP32
+
+| Test | Action | Pass Criteria |
 |---|---|---|
-| Power/PFT | Start panel state machine | `PFT`, then normal ready state. |
-| FD on | Press `FD` with FD off | active lateral `ROL`, active vertical `PIT`, `ALTS` armed if configured. |
-| AP on from FD off | Press `AP` | `AP` on, active `ROL`/`PIT`. |
-| AP on from FD on | Press `AP` after selecting modes | `AP` on, previous active FD modes preserved. |
-| AP manual disconnect | Press AP disconnect | `AP` flashes attention state for about 5 sec, then off. |
-| YD engagement | Press `YD` if configured | `YD` displayed steady active. |
-| Invalid AP/FD combination | Force or receive AP on with FD off | State manager corrects to FD on or rejects the update. |
+| Connect to MSFS | Start connector with MSFS running. | GUI shows MSFS connected and aircraft detected. |
+| Read AP state | Toggle AP in virtual cockpit. | Connector AP state changes without ESP32. |
+| Read selected heading | Move heading bug in MSFS. | Connector shows the new heading. |
+| Read selected altitude | Change selected altitude in MSFS. | Connector shows the new altitude. |
+| Send AP event | Press AP command in connector/debug control. | MSFS AP changes or connector reports command failure. |
+| Send HDG event | Press HDG command in connector/debug control. | MSFS changes HDG state or reports unsupported behavior. |
+| No optimistic mode | Press any connector command. | Display snapshot changes only after read-back state changes. |
 
-## Mode-Key Activation Tests
+## Phase 2: Web GUI And Debug Snapshot
 
-| Test | Setup | Action | Expected Display / State |
-|---|---|---|---|
-| HDG activates FD | FD off, AP off | Press `HDG` | FD on, AP off, `HDG` active, `PIT` active. |
-| VS activates FD | FD off, AP off | Press `VS` | FD on, AP off, `ROL` active, `VS` active. |
-| ALT activates FD | FD off, AP off | Press `ALT` | FD on, AP off, `ROL` active, `ALT` active. |
-| Valid GPS NAV activates FD | FD off, AP off, valid GPS course | Press `NAV` | FD on, AP off, `GPS` active or armed, `PIT` active. |
-| Invalid NAV does not activate FD | FD off, AP off, no valid nav source | Press `NAV` | No state change; diagnostic recorded. |
-| LVL engages AP | FD off, AP off | Press `LVL` | FD on, AP on, `LVL` active on both axes. |
-| GA does not engage AP | FD off, AP off | Press `GA` | FD on, AP off, `GA` active on both axes. |
-| Active HDG deselection | FD on, AP off, `HDG` active | Press `HDG` | `ROL` active, AP remains off. |
-| Armed GPS NAV deselection | `HDG` active, `GPS_NAV` armed | Press `NAV` | `HDG` remains active, GPS armed indication removed. |
-| Active GPS NAV deselection | `GPS_NAV` active | Press `NAV` | `ROL` active. |
-| Armed GPS APR deselection | `HDG` active, `GPS_APR` and `GP` armed | Press `APR` | `HDG` remains active, GPS and `GP` armed indications removed. |
-| Active GPS APR deselection | `GPS_APR` active, `GP` armed or active | Press `APR` | Lateral reverts to `ROL`; `GP` is removed and vertical reverts to `PIT` if `GP` was active. |
-| FD key disabled with AP | FD on, AP on | Press `FD` | No state change. |
+Use connector debug snapshots. No COM port or ESP32 is required.
 
-## Vertical Mode Tests
+| Test | Action | Pass Criteria |
+|---|---|---|
+| Start web debug | Run connector in web debug mode. | GUI opens and polls snapshots. |
+| SVG panel | Load the web page. | GMC 605 SVG panel is visible with LCD and LED overlays aligned. |
+| LCD slots | Set lateral/vertical active and armed modes. | Left LCD shows lateral active/armed; center LCD shows vertical active/armed and reference. |
+| AP/FD/YD LEDs | Toggle AP, FD, and YD in the snapshot editor. | Key-adjacent LEDs change; AP/FD/YD do not appear as normal LCD text. |
+| GMC lateral labels | Set `GPS`, `VOR`, `LOC`, `VAPP`, and `BC`. | LCD displays the same real GMC 605 label, with `VAPP` used for VOR approach. |
+| Empty armed mode | Set armed modes to `NONE`. | Armed LCD fields are blank. |
+| Reference editing | Change heading, altitude, VS, and speed. | Reference area and data sections update without hand-editing JSON. |
+| Aircraft data editing | Change aircraft heading, altitude, VS, airspeed, CDI, and GSI. | Snapshot endpoint returns the changed values. |
+| Messages | Add up to four messages. | Message area shows short status/alert text. |
 
-| Test | Setup | Action | Expected Display |
-|---|---|---|---|
-| Pitch default | FD/AP off | Press `FD` or `AP` | `PIT` active. |
-| Pitch wheel | `PIT` active | NOSE UP/DN | pitch reference changes by 0.5 deg per click. |
-| VS select | Stable flight | Press `VS` | `VS` active, VS ref shown, `ALTS` armed if configured. |
-| VS wheel | `VS` active | NOSE UP/DN | VS ref changes by 100 fpm per click. |
-| IAS select | Stable flight | Press `IAS` | `IAS` active, airspeed ref shown, `ALTS` armed if configured. |
-| FLC select | Stable flight | Press `FLC` | `FLC` active, airspeed ref shown, `ALTS` armed if configured. |
-| ALT select | Any stable altitude | Press `ALT` | `ALT` active, altitude ref nearest 10 ft. |
-| ALTS capture | Climb/descent toward selected altitude | Let aircraft approach selected altitude | `ALTS` active/capture attention, `ALT` armed. |
-| ALT final capture | Within about 50 ft of selected altitude | Continue | `ALT` active. |
-| GP arm | GPS approach loaded, GPS source | Press `APR` | lateral `GPS` armed/active, vertical `GP` armed. |
-| GP capture | Intercept glidepath | Continue inbound | `GP` active. |
-| GS arm | ILS loaded, LOC source valid | Press `APR` | lateral `LOC` armed/active, vertical `GS` armed. |
-| GS capture | Intercept glideslope | Continue inbound | `GS` active. |
-| Multiple vertical arms | `VPTH` active on a GPS approach, descending toward a constraint | Arm approach and continue descent | `ALTV` and `GP` are both armed while `VPTH` remains active. |
-| VNV deselection while armed | `VPTH` armed | Press `VNV` | Current active vertical mode remains; `VPTH` and `ALTV` are removed. |
-| VNV deselection while active | `VPTH` active | Press `VNV` | Vertical reverts to `PIT`; VNAV armed modes are removed. |
-| Selected altitude changed during capture | `ALTS` active | Change selected altitude | `PIT` active and `ALTS` armed for the new target. |
-| LVL | Any mode | Press `LVL` | `LVL` active in lateral and vertical, armed modes cleared. |
-| GA | Any airborne mode | Press `GA` | `GA` active in lateral and vertical, `ALTS` armed if configured. |
-| GA attitude modification | `GA` active | Use CWS or NOSE UP/DN wheel | Lateral `ROL`, vertical `PIT`, and `ALTS` armed if configured. |
+## Phase 3: ESP32 Without MSFS
 
-## Lateral Mode Tests
+Use connector debug snapshots.
 
-| Test | Setup | Action | Expected Display |
-|---|---|---|---|
-| Roll default wings level | Bank less than 6 deg | Activate FD/AP | `ROL`, command wings level. |
-| Roll hold | Bank 6 to 25 deg | Activate FD/AP | `ROL`, hold bank reference. |
-| Roll limit | Bank more than 25 deg | Activate FD/AP | `ROL`, limit bank command to 25 deg. |
-| HDG | Heading bug set | Press `HDG` | `HDG` active. |
-| GPS NAV arm | GPS source, CDI more than half scale | Press `NAV` | previous lateral active, `GPS` armed. |
-| GPS NAV capture | Course intercept | Continue | `GPS` active. |
-| VOR NAV arm | VOR source, CDI more than half scale | Press `NAV` | previous lateral active, `VOR` armed. |
-| LOC NAV capture | LOC source, CDI less than half scale | Press `NAV` | `LOC` active. |
-| GPS APR | GPS approach loaded | Press `APR` | `GPS` approach active/armed; `GP` armed if vertical guidance exists. |
-| VOR APR | VOR approach | Press `APR` | `VAPP` on GMC-style display, or `VOR` on GI 285-style display. |
-| LOC APR | ILS/LOC approach | Press `APR` | `LOC` lateral, `GS` armed if glideslope exists. |
-| GPS NAV to APR semantic conversion | `GPS_NAV` active or armed | Press `APR` | Visible `GPS` remains, internal owner becomes `GPS_APR`, and `GP` arms. |
-| GPS APR to NAV semantic conversion | `GPS_APR` active or armed, `GP` armed | Press `NAV` | Visible `GPS` remains, internal owner becomes `GPS_NAV`, and `GP` cancels. |
-| LOC NAV to APR semantic conversion | `LOC_NAV` active or armed | Press `APR` | Visible `LOC` remains, internal owner becomes `LOC_APR`, and `GS` arms. |
-| LOC APR to NAV semantic conversion | `LOC_APR` active or armed, `GS` armed | Press `NAV` | Visible `LOC` remains, internal owner becomes `LOC_NAV`, and `GS` cancels. |
-| LOC capture inhibit | `LOC_APR` armed, heading differs from course by more than 105 deg | Intercept localizer signal | `LOC_APR` remains armed and does not capture. |
-| DG cannot arm | DG profile, valid source, CDI more than half scale | Press `NAV`, `APR`, or `BC` | No armed lateral mode is entered. |
-| BC | Localizer backcourse scenario | Press `BC` | `BC` active/armed depending capture. |
-| Source change reversion | NAV/APR active, autoswitch disabled | Change nav source | Revert lateral active to `ROL`. |
+| Test | Action | Pass Criteria |
+|---|---|---|
+| Boot display | Power ESP32. | OLED shows boot/PFT or link status. |
+| Link waiting | Do not start connector. | OLED shows `LINK`. |
+| Fake snapshot | Send debug snapshot from connector. | OLED shows expected labels and LED states. |
+| Snapshot update | Change fake AP/HDG/ALT labels. | OLED updates without reboot. |
+| Blink/inverse | Send alert style. | OLED blink/inverse timing is readable. |
+| Button command | Press each panel button. | Connector receives the correct semantic command. |
+| Encoder command | Rotate each encoder. | Connector receives correct increment/decrement events. |
+| Link stale | Stop connector packets. | OLED marks stale/lost link within timeout. |
 
-## VNAV Tests
+## Phase 4: Full MSFS Loop
 
-Treat as phase-2 unless the selected MSFS aircraft exposes enough VNAV state.
+| Test | Action | Pass Criteria |
+|---|---|---|
+| MSFS to OLED | Toggle AP in virtual cockpit. | OLED follows MSFS state. |
+| OLED not optimistic | Press ESP32 AP button. | OLED changes only after connector sends updated snapshot. |
+| AP button | Press ESP32 AP. | MSFS AP changes, then OLED updates. |
+| FD button | Press ESP32 FD. | MSFS FD changes, then OLED updates. |
+| HDG button | Press ESP32 HDG. | MSFS HDG state changes or connector reports unsupported command. |
+| NAV/APR buttons | Press ESP32 NAV/APR in valid scenarios. | Connector logs event and OLED shows MSFS-derived result. |
+| ALT button | Press ESP32 ALT. | MSFS ALT state changes, then OLED updates. |
+| VS/FLC/IAS | Press selected speed/vertical mode buttons. | OLED follows target aircraft behavior. |
+| Reference encoders | Turn HDG/ALT/VS/speed controls. | MSFS selected reference changes and OLED follows. |
+| AP disconnect | Trigger AP disconnect. | AP LED/status follows snapshot alert timing; LCD message area shows relevant alert if supplied. |
 
-| Test | Setup | Action | Expected Display |
-|---|---|---|---|
-| VNAV arm | GPS flight plan with constraints | Press `VNV` | `VPTH` armed. |
-| VNAV capture | Reach TOD/path | Continue | `VPTH` active. |
-| Constraint capture | VNAV descent to constraint | Continue | `ALTV` active or armed. |
-| VNAV to GPS approach | VNAV active, GPS APR armed | Intercept glidepath | transition to `GP`. |
-| VNAV to ILS | VNAV active, LOC/GS armed | Intercept localizer/glideslope | transition to `LOC`/`GS`. |
+## Phase 5: Failure And Edge Tests
 
-## Automatic Reversion And Protection Tests
-
-| Test | Setup | Action | Expected Display / State |
-|---|---|---|---|
-| Active lateral data invalid | NAV/APR active | Invalidate required navigation data | Lateral reverts to wings-level `ROL`; dropped mode flashes yellow. |
-| Active vertical data invalid | Air-data-dependent vertical mode active | Invalidate required mode data | Vertical reverts to `PIT`; dropped mode flashes yellow. |
-| Default-mode attitude invalid | FD active | Invalidate required attitude data | FD disables and active/armed mode annunciations clear. |
-| Overspeed enter and restore | `VS` active | Trigger and then clear overspeed | `MAXSPEED`; `IAS`/`FLC` active; `VS` shown armed, then restored active when clear. |
-| Altitude-critical underspeed | `GP` active with AP on | Trigger and then clear underspeed | `MINSPEED`; `ROL` and `IAS`/`FLC` active; prior lateral and `GP` shown armed, then restored. |
-| Non-altitude-critical underspeed | `VS` active with AP on | Trigger and then clear underspeed | `MINSPEED`; lateral unchanged; `IAS`/`FLC` active; `VS` shown armed, then restored. |
+| Test | Action | Pass Criteria |
+|---|---|---|
+| MSFS closes | Close MSFS while connector stays running. | GUI and OLED show `SIM` or disconnected state. |
+| Connector closes | Stop connector while ESP32 runs. | OLED shows `LINK` after timeout. |
+| Bad packet | Inject malformed snapshot. | ESP32 ignores it and keeps previous valid display. |
+| Unsupported command | Send command not mapped for aircraft. | GUI reports rejected/unsupported; OLED does not invent state. |
+| Rapid button presses | Press buttons quickly. | Debounce prevents duplicate accidental commands. |
+| Encoder burst | Spin encoder quickly. | Connector receives bounded, ordered increments. |
+| Unknown mode | Force an unmapped SimVar combination. | Connector leaves the slot blank or uses a debug marker; ESP32 does not guess. |
 
 ## Pass Criteria
 
-- Active lateral and vertical labels match expected mode state.
-- Internal NAV/APR ownership is correct even when the visible `GPS` or `LOC`
-  label does not change.
-- All compatible armed vertical labels appear; one armed mode must not erase
-  another.
-- Protection restore targets are kept separate from normal capture-armed modes.
-- Coupled modes `LVL` and `GA` replace both lateral and vertical active labels.
-- References update with the expected step size.
-- Flash/attention states expire and do not leave stale labels.
-- Local Garmin-style display state remains stable even when MSFS lacks a perfect matching mode.
+The project passes the restart validation when:
 
+- The ESP32 never claims a mode changed before MSFS/connector state confirms it.
+- The connector GUI shows MSFS connection, ESP32 connection, last snapshot, and command log.
+- The OLED/LCD model shows lateral and vertical mode labels, selected references,
+  AP/FD/YD LED states, and link/sim faults in the correct regions.
+- AP/FD/YD are rendered as key-adjacent indicators, not normal LCD text.
+- Every physical input creates the expected connector command.
+- Link loss and MSFS disconnect are obvious on the display.
+
+## Recommended Next Step
+
+Run Phase 1 and Phase 2 before doing any aircraft-specific AP mode tuning.

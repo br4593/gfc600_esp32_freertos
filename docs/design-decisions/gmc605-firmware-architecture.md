@@ -1,381 +1,212 @@
-# GMC 605 Firmware Architecture
+# GMC 605 ESP32 Firmware Architecture
 
 ## Goal
 
-Define a clean ESP-IDF + FreeRTOS firmware architecture for the GMC 605-style MSFS autopilot panel.
+Define the ESP32 firmware after the project restart.
 
-Known hardware direction:
+The ESP32 is now a simulator panel:
 
-- MCU: ESP32-S3 class board/module.
-- Display: SSD1322 OLED over SPI.
-- MSFS link: host-side SimConnect bridge, most likely over USB CDC serial first.
-- Project boundary: simulator-only panel, not real aircraft avionics.
+- It receives display state from the Python MSFS connector.
+- It renders that state on the SSD1322 OLED.
+- It scans buttons and encoders.
+- It sends input commands to the Python connector.
+- It does not decide autopilot modes.
 
-Related documents:
+Simulator boundary: this is for Microsoft Flight Simulator only.
 
-- [GFC 600 Mode Logic](../state-machines/gfc600-mode-logic.md) owns mode states
-  and transitions.
-- [MSFS SimVar And Event Map](../research/msfs-gmc605-simvar-event-map.md) owns
-  simulator variable and event mapping.
-- [GMC 605 Display And ESP32 Selection](gmc605-display-and-esp32-selection.md)
-  owns hardware and SSD1322 driver decisions.
+## Sources Used
+
+- User restart instruction: MSFS handles AP logic; ESP32 gets info from MSFS, changes the display, and sends button commands to MSFS.
+- Existing project docs under `docs/`.
+- Microsoft Flight Simulator SDK SimConnect API reference: https://docs.flightsimulator.com/html/Programming_Tools/SimConnect/SimConnect_API_Reference.htm
+- Microsoft Flight Simulator SDK `SimConnect_TransmitClientEvent`: https://docs.flightsimulator.com/html/Programming_Tools/SimConnect/API_Reference/Events_And_Data/SimConnect_TransmitClientEvent.htm
 
 ## Architecture Decision
 
-Use an event-driven firmware with one owner per hardware resource.
+Use a display/input firmware, not an autopilot logic firmware.
 
-Key rule:
-
-- Input code never draws the display.
-- Display code never talks directly to MSFS.
-- MSFS link code never owns Garmin-style mode logic.
-- The state manager is the single owner of the local GMC 605 state model.
-
-## High-Level Diagram
-
-```mermaid
-flowchart TD
-    GPIO[Buttons and encoders] --> InputTask[input_task]
-    InputTask --> EventQ[input_event_queue]
-    EventQ --> StateTask[state_manager_task]
-
-    USB[USB CDC / UART / Wi-Fi link] --> LinkTask[link_task]
-    LinkTask --> HostStateQ[host_state_queue]
-    HostStateQ --> StateTask
-
-    StateTask --> CmdQ[host_command_queue]
-    CmdQ --> LinkTask
-
-    StateTask --> DisplayModel[display_model_snapshot]
-    DisplayModel --> DisplayTask[display_task]
-    DisplayTask --> SSD1322[SSD1322 SPI OLED]
-
-    StateTask --> LogQ[log_queue]
-    LinkTask --> LogQ
-    DisplayTask --> LogQ
-    LogQ --> Diag[diagnostic output]
-```
-
-## Task Ownership
-
-| Task | Priority | Rate / Trigger | Owns | Output |
-|---|---:|---|---|---|
-| `input_task` | high | 100-200 Hz scan or ISR-driven | button debounce, encoder events | semantic input events |
-| `state_manager_task` | high | event-driven | GMC 605 state, mode transitions, timers | host commands, display snapshots |
-| `display_task` | medium | 20-30 Hz, plus dirty updates | SSD1322 driver, framebuffer, flash phase | SPI display updates |
-| `link_task` | medium-high | packet-driven, 20-100 Hz host update | USB/Wi-Fi/UART protocol | host state packets and commands |
-| `health_task` | low | 1-5 Hz | watchdog, link timeout, task heartbeat | health flags, diagnostics |
-| `log_task` | low | best effort | debug output | serial/log sink |
-
-Priority notes:
-
-- `input_task` and `state_manager_task` should feel immediate.
-- `display_task` can lag a few tens of milliseconds without hurting usability.
-- `link_task` should not block the state manager.
-- Logging must never block input or display updates.
-
-## Core Modules
-
-| Module | Responsibility |
+| Owner | Owns |
 |---|---|
-| `app_main` | boot order, task creation, watchdog registration |
-| `board_config` | GPIO map, SPI host, display pins, encoder/button layout |
-| `input_service` | debounce, long/short press, encoder direction |
-| `gmc605_state` | local AP/FD/YD/mode/reference model |
-| `mode_logic` | vertical/lateral mode transition rules |
-| `display_model` | active/armed labels, references, flash/inverse styles |
-| `ssd1322_driver` | low-level display init and pixel/byte transfer |
-| `display_renderer` | label layout, font choice, grayscale/inverse rendering |
-| `host_protocol` | packet encode/decode between ESP32 and PC bridge |
-| `msfs_adapter_model` | firmware-side representation of host SimVars |
-| `health_monitor` | link timeout, stale data, task heartbeat |
-| `test_mocks` | fake inputs and fake host state for bench tests |
+| MSFS aircraft | Real simulator AP state, FD state, YD state, selected references, mode behavior, captures, reversions. |
+| Python connector | SimConnect read/write, aircraft adapters, command mapping, web GUI, snapshot creation. |
+| ESP32 | Buttons, encoders, OLED rendering, link health, local diagnostics. |
+
+Hard rule:
+
+An ESP32 button press is only a command request. The OLED changes after the connector sends back a new snapshot.
 
 ## Data Flow
 
-### Button Press
-
 ```mermaid
-sequenceDiagram
-    participant B as Button
-    participant I as input_task
-    participant S as state_manager_task
-    participant L as link_task
-    participant D as display_task
-
-    B->>I: raw GPIO change
-    I->>S: BTN_HDG_PRESS
-    S->>S: update local GMC 605 state
-    S->>L: command AP_HDG_HOLD_ON
-    S->>D: display snapshot HDG active
+flowchart LR
+    MSFS[MSFS aircraft AP logic] --> SimConnect[Python SimConnect connector]
+    SimConnect --> Snapshot[Display snapshot]
+    Snapshot --> ESP32[ESP32 panel]
+    ESP32 --> OLED[SSD1322 OLED]
+    Buttons[Buttons / encoders] --> ESP32
+    ESP32 --> Command[Command packet]
+    Command --> SimConnect
+    SimConnect --> Event[SimConnect event]
+    Event --> MSFS
 ```
 
-### Host State Update
+## ESP32 Tasks
 
-```mermaid
-sequenceDiagram
-    participant H as Host bridge
-    participant L as link_task
-    participant S as state_manager_task
-    participant D as display_task
+Start with a small task set.
 
-    H->>L: AP/nav state packet
-    L->>S: decoded host state
-    S->>S: reconcile local state with MSFS evidence
-    S->>D: updated display snapshot
-```
+| Task | Priority | Responsibility |
+|---|---:|---|
+| `input_task` | high | Scan buttons/encoders, debounce, emit semantic command requests. |
+| `link_task` | medium-high | Receive connector snapshots and send input commands. |
+| `panel_state_task` | medium | Store latest snapshot, track stale/lost link, prepare display model. |
+| `display_task` | medium | Own SSD1322, framebuffer, fonts, blink/inverse rendering. |
+| `health_task` | low | Watchdog, stuck input detection, diagnostics. |
 
-## State Manager Rules
+Do not split into more tasks until a real timing problem appears.
 
-The state manager should be the only writer for:
+## Firmware Modules
 
-- active lateral mode
-- armed lateral mode
-- active vertical mode
-- armed vertical mode set
-- suspended protection restore modes
-- AP/FD/YD displayed state
-- selected references copied into the display model
-- alert timers and flash timers
-- host command intent
-
-It must also preserve semantic NAV/APR ownership even when both states render as
-the same `GPS` or `LOC` label.
-
-The state manager should receive:
-
-- clean input events
-- decoded host state
-- timer ticks
-- health/link status
-
-It should emit:
-
-- display snapshots
-- host command packets
-- diagnostics
-
-## Display Architecture
-
-Use two layers:
-
-```text
-display_model
-    what to show:
-    - label text
-    - slot
-    - style
-    - priority
-    - expiry time
-
-display_renderer
-    how to show it on SSD1322:
-    - font
-    - x/y position
-    - brightness
-    - inverse video
-    - blink phase
-    - SPI transfer
-```
-
-This keeps Garmin-style logic out of the SSD1322 driver.
-
-The state manager decides what labels exist. The display model resolves slot,
-priority, effect, and expiry metadata. The renderer only converts that snapshot
-into pixels.
-
-### Monochrome Style Mapping
-
-| Garmin Style | SSD1322 Substitute |
+| Module | Keep It Focused On |
 |---|---|
-| Green active | Bright steady text |
-| White armed | Dimmer or smaller steady text |
-| Yellow attention | Flashing text or inverse video |
-| Red failure | Fast flashing inverse video |
-| New capture flash | Bright or inverse flash with timeout |
+| `board_config` | GPIOs, SPI pins, display pins, encoder/button layout. |
+| `input_service` | Debounce and encoder direction only. |
+| `host_protocol` | Newline JSON or later binary framing. |
+| `panel_state` | Latest connector snapshot and link health. |
+| `display_model` | Slot text, style, priority, expiry. |
+| `display_renderer` | SSD1322 pixels, fonts, brightness, blink phase. |
+| `health_monitor` | Link timeout, malformed packets, stuck buttons. |
 
-### Display Priority
+Avoid modules named like autopilot controllers, guidance managers, or mode engines. That logic belongs in MSFS and the connector adapter.
 
-When space is limited, render in this order:
+## Snapshot Model
 
-1. Failures and abnormal AP/YD states.
-2. Manual disconnect alerts.
-3. Active lateral and vertical modes.
-4. Armed lateral and vertical modes.
-5. References.
-6. Advisory messages.
+The connector should send one complete panel snapshot. The ESP32 should not need raw SimVars.
 
-## Display Slots
+Recommended snapshot groups:
 
-Suggested first SSD1322 layout:
-
-```text
-+------------------------------------------------+
-| LAT ACTIVE       AP/YD MSG       VERT ACTIVE   |
-| LAT ARMED        REF/ALERT       VERT ARMED    |
-+------------------------------------------------+
-```
-
-Suggested slot names:
-
-| Slot | Example |
+| Group | Examples |
 |---|---|
-| `display_slot_lat_active` | `HDG`, `GPS`, `LOC`, `ROL` |
-| `display_slot_lat_armed` | `GPS`, `VOR`, `LOC`, `BC` |
-| `display_slot_status` | `AP`, `YD`, disconnect flash |
-| `display_slot_message` | `PFT`, `MINSPEED`, `ESP OFF` |
-| `display_slot_vert_active` | `ALT`, `VS`, `IAS`, `FLC`, `GP`, `GS` |
-| `display_slot_vert_armed` | `ALTS`, `GP`, `GS`, `VPTH` |
-| `display_slot_reference` | `5500`, `+500`, `120KT` |
+| Link/sim | connector connected, MSFS connected, aircraft profile, timestamp. |
+| Key LEDs | AP, FD, YD LED state, disconnect alert, failure alert. |
+| Lateral LCD | active label, armed label, source, CDI valid/needle if useful. |
+| Vertical LCD | active label, armed labels, GSI/VDEV valid/needle if useful. |
+| Mode reference | selected altitude, vertical speed, IAS/FLC speed, pitch reference if known. |
+| Messages | `LINK`, `SIM`, `PFT`, `DISABLED`, command pending/fail. |
+| Style metadata | steady, dim, inverse, slow flash, fast flash, expires. |
 
-The active and armed label conditions are defined in
-[GFC 600 Mode Logic](../state-machines/gfc600-mode-logic.md). Do not duplicate
-that trigger table in the renderer.
+The ESP32 may reject malformed snapshots, but it should not reinterpret AP behavior.
 
-## Flashing And Alerts
+The snapshot should already contain GMC 605-style LCD text such as `GPS`,
+`VOR`, `LOC`, `VAPP`, `ALT`, `VS`, `ALTS`, `GP`, or `GS`. Keep richer
+diagnostic or aircraft-adapter fields on the connector side unless the ESP32
+renderer needs them.
 
-Store flashing as display metadata:
+## Command Model
 
-| Field | Meaning |
+ESP32 to connector commands should be semantic and small.
+
+| Input | Command Meaning |
 |---|---|
-| `effect` | steady, slow flash, fast flash, inverse flash |
-| `started_ms` | when the effect started |
-| `expires_ms` | when the effect should stop, or zero for persistent |
-| `priority` | resolves conflicts when slots are crowded |
+| `AP` button | Request AP toggle or profile-specific AP action. |
+| `FD` button | Request FD toggle. |
+| `YD` button | Request YD toggle. |
+| `HDG`, `NAV`, `APR`, `BC` | Request lateral mode button press. |
+| `ALT`, `VS`, `IAS/FLC` | Request vertical mode button press. |
+| Heading encoder | Request heading bug increment/decrement. |
+| Altitude encoder | Request selected altitude increment/decrement. |
+| VS/speed controls | Request selected reference increment/decrement. |
+| AP disconnect | Request AP disconnect. |
 
-The display task calculates the current visible/inverse phase from `esp_timer_get_time()` or a periodic tick. The state manager only sets the effect.
+The connector maps those commands to SimConnect Key Events, Input Events, or aircraft-specific adapter actions.
 
-## SSD1322 Driver Boundary
+## Display Rules
 
-The display task owns the SSD1322 device and framebuffer. No other task may
-call the driver directly. Keep the renderer API independent of U8g2 or any
-future native SSD1322 driver.
+The display task renders what the snapshot says.
 
-The driver choice, U8g2 constructors, and fallback plan are recorded only in
-[GMC 605 Display And ESP32 Selection](gmc605-display-and-esp32-selection.md).
+GMC 605-style display ownership:
 
-## Host Link Protocol
+| Area | Firmware Rendering Rule |
+|---|---|
+| Left LCD upper | Active lateral mode, large/bright. |
+| Left LCD lower | Armed lateral mode, smaller. Blank when `NONE`. |
+| Center LCD upper | Active vertical mode, large/bright. |
+| Center LCD lower | Armed vertical modes, smaller. Blank when empty. |
+| Mode reference | Numeric vertical reference when the snapshot supplies one. |
+| Right LCD | Short status messages and alerts, up to four lines. |
+| AP/FD/YD | Key-adjacent LED indicators, not normal LCD text. |
 
-Start with USB CDC serial.
+Allowed local display decisions:
 
-Packet types:
+- Blink timing.
+- Inverse-video phase.
+- Font and slot placement.
+- Showing `LINK` when connector packets are stale.
+- Showing `SIM` when the connector reports MSFS disconnected.
+- Keeping the last good snapshot briefly during a link timeout.
 
-| Direction | Packet | Purpose |
+Not allowed in ESP32 firmware:
+
+- Turning `HDG` active because the `HDG` button was pressed.
+- Arming `GP` because `APR` was pressed.
+- Inventing `ALT`, `ALTS`, `GS`, `GP`, or `VPTH` transitions.
+- Resolving aircraft-specific MSFS behavior.
+
+## Link Protocol
+
+First version:
+
+- Newline-delimited UTF-8 JSON.
+- Start at `115200 8N1` or USB CDC serial.
+- Each line is one complete message.
+- Every message includes protocol version and type.
+
+Message types:
+
+| Direction | Type | Purpose |
 |---|---|---|
-| ESP32 to host | input command | button/encoder action such as `BTN_AP`, `ENC_ALT_PLUS` |
-| ESP32 to host | heartbeat | panel alive, firmware version |
-| Host to ESP32 | AP/nav state | condensed SimVar state |
-| Host to ESP32 | link/config | aircraft profile, feature flags |
-| Host to ESP32 | error/status | host bridge error, MSFS disconnected |
+| Connector to ESP32 | `hello` | Protocol/version/profile. |
+| Connector to ESP32 | `snapshot` | Complete display state. |
+| Connector to ESP32 | `command_result` | Command accepted/rejected/failed. |
+| Connector to ESP32 | `error` | Connector or MSFS problem. |
+| ESP32 to connector | `command` | Button/encoder request. |
+| ESP32 to connector | `heartbeat` | Panel alive and firmware version. |
 
-Do not send raw SimVars one by one to the display task. The host bridge should condense MSFS state into a firmware-friendly model.
+Readable JSON is acceptable for bring-up. Move to binary only after measurement shows JSON is the problem.
 
-## Timing Budget
+## Timing Targets
 
 | Function | Target |
 |---|---:|
 | Button debounce | 20-40 ms |
-| Encoder event latency | less than 20 ms preferred |
+| Encoder event latency | under 20 ms preferred |
 | Display refresh | 20-30 Hz |
-| Flash phase tick | 2-4 Hz visual phase, computed locally |
-| Host state update | 10-20 Hz minimum, 50 Hz nice |
-| Link timeout indication | 500-1000 ms |
-
-## Core Affinity Suggestion
-
-Start simple and only pin tasks if needed.
-
-Possible ESP32-S3 split:
-
-| Core | Work |
-|---|---|
-| Core 0 | Wi-Fi/USB stack, link task, logging |
-| Core 1 | input task, state manager, display task |
-
-If USB CDC only is used and no Wi-Fi is active, core pinning may not matter at first.
-
-## First Hardware Pin Planning
-
-Reserve these groups before locking the PCB profile:
-
-| Function | Pins Needed |
-|---|---:|
-| SSD1322 SPI | SCLK, MOSI, CS, DC, RESET, optional display power enable |
-| Encoders | Two pins per encoder, plus push pins if used |
-| Buttons | Direct GPIO or row/column matrix |
-| Host link | Native USB CDC preferred for development |
-| Debug | USB serial/JTAG and one spare GPIO LED |
+| Connector snapshot rate | 5-20 Hz |
+| Link stale indication | 500-1000 ms |
+| Link lost indication | 2-3 seconds |
 
 ## Error Handling
 
-Firmware should handle:
+| Condition | ESP32 Behavior |
+|---|---|
+| No connector yet | Show `LINK`; inputs may still be logged locally. |
+| Connector alive, MSFS disconnected | Show `SIM`. |
+| Snapshot stale | Keep last snapshot and show stale/link marker. |
+| Snapshot invalid | Ignore packet, count error, keep previous valid snapshot. |
+| Command rejected | Show short command-fail message if connector provides one. |
+| Display init failed | Keep link/input alive for diagnostics. |
 
-- host link lost
-- stale host state
-- display init failure
-- stuck button
-- encoder bounce/noise
-- malformed packets
-- host says MSFS disconnected
+## Bring-Up Order
 
-Display behavior:
-
-- If host link is lost, keep local panel responsive but show `LINK`.
-- If MSFS is disconnected, show `SIM`.
-- If display init fails, log error and keep input/link tasks alive for diagnostics.
-
-Project risks:
-
-- Generic MSFS variables may not expose Garmin-style capture logic cleanly.
-- Some aircraft require custom Input Events or LVars/HVars.
-- A bare SSD1322 panel may not accept 3.3 V logic directly.
-- Logging or link processing must never block input, state, or display work.
-
-## Testing Strategy
-
-### Hardware-Free Tests
-
-- state transitions from input events
-- display model generation
-- packet encode/decode
-- timer expiry for flashing labels
-
-### Hardware Bench Tests
-
-- SSD1322 static render
-- grayscale/inverse/flash effects
-- all buttons and encoders
-- USB CDC packet loopback
-- link timeout display
-
-### MSFS Integration Tests
-
-- AP, FD, YD
-- HDG, NAV, APR, BC
-- ALT, VS, IAS/FLC
-- GS/GP arming and capture
-- AP disconnect alert
-
-## Recommended Firmware Bring-Up Order
-
-```mermaid
-flowchart TD
-    A[Board boots and logs version] --> B[SSD1322 static display]
-    B --> C[Display slots and fonts]
-    C --> D[Input scan and encoder events]
-    D --> E[Local state manager without MSFS]
-    E --> F[USB CDC packet link]
-    F --> G[Host bridge sends fake state]
-    G --> H[Real SimConnect state packets]
-    H --> I[Mode reconciliation and test flights]
-```
+1. Render a static SSD1322 test screen.
+2. Scan buttons and encoders.
+3. Send button/encoder command packets to a debug connector.
+4. Receive fake snapshots from the connector and render them.
+5. Add link stale/lost display behavior.
+6. Connect the Python connector to real MSFS.
+7. Tune labels and aircraft adapter behavior from logged flights.
 
 ## Recommended Next Step
 
-Do a display bring-up spike first:
+Build the connector web GUI and ESP32 fake-snapshot loop together.
 
-- Add a U8g2 ESP-IDF dependency in a tiny test project.
-- Render the exact GMC 605 slot layout on the SSD1322.
-- Verify whether `NHD_256X64` or `ZJY_256X64` matches your module.
-- Record the working constructor, pins, SPI speed, contrast, and orientation in a board profile document.
-
+That gives fast feedback without waiting for every MSFS aircraft mode edge case.
