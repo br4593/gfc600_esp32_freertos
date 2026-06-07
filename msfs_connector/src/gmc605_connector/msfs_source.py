@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from typing import Any
 
 from .model import (
@@ -32,6 +33,7 @@ class MsfsSource(SnapshotSource):
         # event name -> mapped SimConnect event id (lazy cache)
         self._events: dict[str, Any] = {}
         self._last_snapshot = PanelSnapshot(source=self.name)
+        self._last_approach_selected = False
 
     def open(self) -> None:
         try:
@@ -44,10 +46,9 @@ class MsfsSource(SnapshotSource):
 
         self._simconnect = SimConnect()
         # Define each SimVar directly. This bypasses AircraftRequests, whose
-        # dictionary is missing several modern MSFS autopilot variables
-        # (APPROACH/ALTITUDE/GLIDESLOPE *ARM*, APPROACH ACTIVE/CAPTURED, etc.).
-        # An unknown name in that list silently reads as None -> False, which
-        # would dead-key the armed annunciations.
+        # dictionary is missing several modern MSFS autopilot variables.
+        # An unknown name in that list silently reads as None, so keep the
+        # requested set explicit and review every mapped variable against the SDK.
         self._requests = {
             name: Request(
                 (simvar, unit),
@@ -58,6 +59,8 @@ class MsfsSource(SnapshotSource):
             for name, (simvar, unit, settable) in _SIMVAR_DEFS.items()
         }
         self._events = {}
+        self._last_snapshot = PanelSnapshot(source=self.name)
+        self._last_approach_selected = False
 
     def close(self) -> None:
         if self._simconnect is not None:
@@ -65,6 +68,7 @@ class MsfsSource(SnapshotSource):
         self._simconnect = None
         self._requests = {}
         self._events = {}
+        self._last_approach_selected = False
 
     def poll(self) -> PanelSnapshot:
         if self._simconnect is None:
@@ -73,13 +77,20 @@ class MsfsSource(SnapshotSource):
         values = {name: self._get(name) for name in _SIMVAR_DEFS}
         snapshot = derive_snapshot(values)
         self._last_snapshot = snapshot
+        self._last_approach_selected = any(
+            to_bool(values.get(name))
+            for name in ("AUTOPILOT_APPROACH_HOLD", "AUTOPILOT_APPROACH_CAPTURED")
+        )
         return snapshot
 
     def handle_command(self, command: Command) -> CommandResult:
         if self._simconnect is None:
             return self._result(command, False, "MSFS source is not open")
 
-        event_name, value = self._map_command(command)
+        try:
+            event_name, value = self._map_command(command)
+        except ValueError as exc:
+            return self._result(command, False, str(exc))
         if event_name is None:
             return self._result(
                 command,
@@ -155,12 +166,14 @@ class MsfsSource(SnapshotSource):
         if name == "NAV_PRESS":
             active = (
                 snapshot.lat_active in {"GPS", "VOR", "LOC"}
-                and not _snapshot_has_approach(snapshot)
+                and not self._last_approach_selected
             )
             return "AP_NAV1_HOLD_OFF" if active else "AP_NAV1_HOLD_ON", None
         if name == "APR_PRESS":
-            active = _snapshot_has_approach(snapshot)
-            return "AP_APR_HOLD_OFF" if active else "AP_APR_HOLD_ON", None
+            return (
+                "AP_APR_HOLD_OFF" if self._last_approach_selected else "AP_APR_HOLD_ON",
+                None,
+            )
         if name == "BC_PRESS":
             return (
                 "AP_BC_HOLD_OFF" if snapshot.lat_active == "BC" else "AP_BC_HOLD_ON",
@@ -187,7 +200,12 @@ class MsfsSource(SnapshotSource):
             "SPEED_SET": "AP_SPD_VAR_SET",
         }
         if name in reference_events:
-            return reference_events[name], to_int(command.value)
+            value = _command_int(command.value, name)
+            if name == "HEADING_SET":
+                value = normalize_heading(value)
+            if name == "SPEED_SET":
+                value = max(0, value)
+            return reference_events[name], value
 
         return None, None
 
@@ -206,27 +224,21 @@ _SIMVAR_DEFS: dict[str, tuple[bytes, bytes, bool]] = {
     "AUTOPILOT_HEADING_LOCK": (b"AUTOPILOT HEADING LOCK", b"Bool", False),
     "AUTOPILOT_NAV1_LOCK": (b"AUTOPILOT NAV1 LOCK", b"Bool", False),
     "AUTOPILOT_APPROACH_HOLD": (b"AUTOPILOT APPROACH HOLD", b"Bool", False),
-    "AUTOPILOT_APPROACH_ARM": (b"AUTOPILOT APPROACH ARM", b"Bool", False),
-    "AUTOPILOT_APPROACH_ACTIVE": (b"AUTOPILOT APPROACH ACTIVE", b"Bool", False),
     "AUTOPILOT_APPROACH_CAPTURED": (
         b"AUTOPILOT APPROACH CAPTURED", b"Bool", False),
     "AUTOPILOT_BACKCOURSE_HOLD": (b"AUTOPILOT BACKCOURSE HOLD", b"Bool", False),
-    "AUTOPILOT_BANK_HOLD": (b"AUTOPILOT BANK HOLD", b"Bool", False),
-    "AUTOPILOT_WING_LEVELER": (b"AUTOPILOT WING LEVELER", b"Bool", False),
-    "AUTOPILOT_PITCH_HOLD": (b"AUTOPILOT PITCH HOLD", b"Bool", False),
+    "AUTOPILOT_APPROACH_IS_LOCALIZER": (
+        b"AUTOPILOT APPROACH IS LOCALIZER", b"Bool", False),
     "AUTOPILOT_ALTITUDE_LOCK": (b"AUTOPILOT ALTITUDE LOCK", b"Bool", False),
     "AUTOPILOT_ALTITUDE_ARM": (b"AUTOPILOT ALTITUDE ARM", b"Bool", False),
     "AUTOPILOT_VERTICAL_HOLD": (b"AUTOPILOT VERTICAL HOLD", b"Bool", False),
     "AUTOPILOT_AIRSPEED_HOLD": (b"AUTOPILOT AIRSPEED HOLD", b"Bool", False),
     "AUTOPILOT_FLIGHT_LEVEL_CHANGE": (
         b"AUTOPILOT FLIGHT LEVEL CHANGE", b"Bool", False),
-    "AUTOPILOT_GLIDESLOPE_ARM": (b"AUTOPILOT GLIDESLOPE ARM", b"Bool", False),
     "AUTOPILOT_GLIDESLOPE_HOLD": (b"AUTOPILOT GLIDESLOPE HOLD", b"Bool", False),
     "AUTOPILOT_GLIDESLOPE_ACTIVE": (
         b"AUTOPILOT GLIDESLOPE ACTIVE", b"Bool", False),
     "GPS_DRIVES_NAV1": (b"GPS DRIVES NAV1", b"Bool", False),
-    "GPS_IS_ACTIVE_FLIGHT_PLAN": (b"GPS IS ACTIVE FLIGHT PLAN", b"Bool", False),
-    "GPS_HAS_GLIDEPATH": (b"GPS HAS GLIDEPATH", b"Bool", False),
     "HSI_HAS_LOCALIZER": (b"HSI HAS LOCALIZER", b"Bool", False),
     "HSI_CDI_NEEDLE": (b"HSI CDI NEEDLE", b"Number", False),
     "HSI_CDI_NEEDLE_VALID": (b"HSI CDI NEEDLE VALID", b"Bool", False),
@@ -262,9 +274,14 @@ def derive_snapshot(values: dict[str, Any]) -> PanelSnapshot:
     )
     gsi = Deviation.from_needle(
         to_bool(values.get("HSI_GSI_NEEDLE_VALID")),
-        values.get("HSI_GSI_NEEDLE"),
+        _normalize_gsi_needle(values.get("HSI_GSI_NEEDLE")),
     )
     nav_source = derive_nav_source(values, cdi.valid)
+    if any(
+        to_bool(values.get(name))
+        for name in ("AUTOPILOT_APPROACH_HOLD", "AUTOPILOT_APPROACH_CAPTURED")
+    ) and to_bool(values.get("AUTOPILOT_APPROACH_IS_LOCALIZER")):
+        nav_source = "LOC"
 
     lat_active = derive_lateral_active(values, fd, nav_source)
     lat_armed = derive_lateral_armed(values, nav_source)
@@ -327,11 +344,12 @@ def derive_lateral_active(
     if any(
         to_bool(values.get(name))
         for name in (
-            "AUTOPILOT_APPROACH_ACTIVE",
             "AUTOPILOT_APPROACH_CAPTURED",
             "AUTOPILOT_APPROACH_HOLD",
         )
     ):
+        if to_bool(values.get("AUTOPILOT_APPROACH_IS_LOCALIZER")):
+            return "LOC"
         return semantic_lateral(nav_source, approach=True)
     if to_bool(values.get("AUTOPILOT_NAV1_LOCK")):
         return semantic_lateral(nav_source, approach=False)
@@ -341,11 +359,9 @@ def derive_lateral_active(
 
 
 def derive_lateral_armed(values: dict[str, Any], nav_source: str) -> str:
-    if to_bool(values.get("AUTOPILOT_APPROACH_ARM")) and not any(
-        to_bool(values.get(name))
-        for name in ("AUTOPILOT_APPROACH_ACTIVE", "AUTOPILOT_APPROACH_CAPTURED")
-    ):
-        return semantic_lateral(nav_source, approach=True)
+    # Generic MSFS SimVars do not expose a reliable NAV/APR armed state.
+    # AUTOPILOT APPROACH ARM is documented as approach-flight-plan activity,
+    # not the panel's selected/armed lateral mode.
     return "NONE"
 
 
@@ -354,11 +370,11 @@ def derive_vertical_active(
 ) -> str:
     if not fd:
         return "NONE"
-    if any(
+    if nav_source == "LOC" and any(
         to_bool(values.get(name))
         for name in ("AUTOPILOT_GLIDESLOPE_ACTIVE", "AUTOPILOT_GLIDESLOPE_HOLD")
     ):
-        return "GP" if nav_source == "GPS" else "GS"
+        return "GS"
     if to_bool(values.get("AUTOPILOT_ALTITUDE_LOCK")):
         return "ALT"
     if to_bool(values.get("AUTOPILOT_FLIGHT_LEVEL_CHANGE")):
@@ -376,18 +392,26 @@ def derive_vertical_armed(
     armed: list[str] = []
     if to_bool(values.get("AUTOPILOT_ALTITUDE_ARM")) and vert_active != "ALT":
         armed.append("ALTS")
-    if to_bool(values.get("AUTOPILOT_GLIDESLOPE_ARM")):
-        mode = "GP" if nav_source == "GPS" else "GS"
-        if mode != vert_active:
-            armed.append(mode)
+    # AUTOPILOT GLIDESLOPE ARM is documented as active-on-glideslope and
+    # therefore cannot safely drive a distinct armed annunciation.
     return armed
 
 
-def _snapshot_has_approach(snapshot: PanelSnapshot) -> bool:
-    if snapshot.lat_active == "VAPP" or snapshot.lat_armed == "VAPP":
-        return True
-    if snapshot.lat_active == "LOC" or snapshot.lat_armed == "LOC":
-        return snapshot.vert_active == "GS" or "GS" in snapshot.vert_armed
-    if snapshot.lat_active == "GPS" or snapshot.lat_armed == "GPS":
-        return snapshot.vert_active == "GP" or "GP" in snapshot.vert_armed
-    return False
+def _command_int(value: object, command_name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{command_name} value must be a number")
+    if not math.isfinite(float(value)):
+        raise ValueError(f"{command_name} value must be finite")
+    return int(round(float(value)))
+
+
+def _normalize_gsi_needle(value: object) -> float | None:
+    if value is None:
+        return None
+    try:
+        raw = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(raw):
+        return None
+    return raw * 127.0 / 119.0

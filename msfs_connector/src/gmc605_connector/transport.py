@@ -71,14 +71,17 @@ class SerialTransport(Transport):
             self._buffer = bytearray(remaining)
             if not line.strip():
                 continue
+            raw = line.decode("utf-8", errors="replace")
             try:
-                messages.append(decode_message(line))
-            except ProtocolError as exc:
+                message = decode_message(line)
+                message["_raw"] = raw
+                messages.append(message)
+            except ProtocolError:
                 messages.append(
                     {
                         "v": 1,
-                        "type": "_transport_error",
-                        "message": str(exc),
+                        "type": "_transport_raw",
+                        "raw": raw,
                     }
                 )
         return messages

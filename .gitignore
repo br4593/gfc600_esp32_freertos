@@ -5,6 +5,7 @@ web-ui*.err.log
 __pycache__/
 .pytest_cache/
 *.pyc
+.~lock.*#
 
 firmware/build/
 sdkconfig

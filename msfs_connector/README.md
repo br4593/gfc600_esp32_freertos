@@ -32,12 +32,31 @@ python -m pip install -e .
 python -m gmc605_connector --list-ports
 ```
 
+## Simple Interactive Launch
+
+Launch without arguments:
+
+```powershell
+python -m gmc605_connector
+```
+
+The connector asks whether to use Debug or MSFS mode, then asks which detected
+serial port belongs to the ESP32. Debug is the default mode when Enter is
+pressed.
+
 ## Run With MSFS
 
 Start MSFS and load an aircraft before starting the connector:
 
 ```powershell
 python -m gmc605_connector --mode msfs --port COM5
+```
+
+SimConnect startup is bounded to 5 seconds by default, so a stalled simulator
+does not leave the headless connector hanging. Adjust it when needed:
+
+```powershell
+python -m gmc605_connector --mode msfs --port COM5 --source-open-timeout 10
 ```
 
 The default UART settings are `115200 8N1` with no flow control.
@@ -58,8 +77,17 @@ debug data, with a UART-connected ESP32, or without a UART for desktop testing.
 Debug GUI without ESP32 hardware:
 
 ```powershell
-python -m gmc605_connector --web --mode debug
+python -m gmc605_connector --web
 ```
+
+The dashboard starts in Debug mode. Use its **Connector Source** selector to
+switch between Debug, MSFS, and Auto while it remains open. Use the **ESP32
+UART** controls to refresh and select from the visible detected-port list,
+enter a port manually, connect, or disconnect without restarting the dashboard.
+The **ESP32 Prints / UART RX** monitor displays raw lines printed or transmitted
+by the ESP32. The **ESP32 Receives / UART TX** monitor displays JSON lines sent
+by the connector to the ESP32. Port detection also reports when `pyserial` is
+missing.
 
 MSFS GUI with ESP32 on `COM5`:
 
@@ -77,6 +105,9 @@ The GUI shows connector status, latest telemetry, AP mode fields, references,
 raw protocol snapshots, and command buttons. In web mode, the server stays up
 even if MSFS or the serial port is not ready yet; it retries and shows the last
 connection error in the page log.
+
+The web server starts before attempting SimConnect, so the dashboard remains
+reachable even when SimConnect startup stalls.
 
 ## Run In Debug Mode
 
@@ -109,10 +140,13 @@ the UART framing without physical hardware.
 The first protocol is newline-delimited UTF-8 JSON. Each line is one complete
 message. The `v` field is the protocol version.
 
+The firmware-facing field reference and receive workflow are documented in
+[`docs/workflows/esp32-connector-output-protocol.md`](../docs/workflows/esp32-connector-output-protocol.md).
+
 Connector to ESP32 snapshot:
 
 ```json
-{"v":1,"type":"snapshot","seq":42,"source":"msfs","sim_connected":true,"ap":true,"fd":true,"yd":false,"lat_active":"HDG","lat_armed":"GPS","vert_active":"VS","vert_armed":["ALTS"],"nav_source":"GPS","cdi":{"valid":true,"needle":90,"half_scale":"GREATER"},"gsi":{"valid":false,"needle":0},"references":{"heading_deg":270,"altitude_ft":5000,"vs_fpm":500,"speed_kt":120},"aircraft":{"heading_deg":250,"altitude_ft":3200,"vs_fpm":450,"airspeed_kt":118},"messages":[]}
+{"v":1,"type":"snapshot","seq":42,"timestamp_ms":1780767726568,"source":"msfs","sim_connected":true,"ap":true,"fd":true,"yd":false,"lat_active":"HDG","lat_armed":"NONE","vert_active":"VS","vert_armed":["ALTS"],"nav_source":"GPS","cdi":{"valid":true,"needle":90,"half_scale":"GREATER"},"gsi":{"valid":false,"needle":0,"half_scale":"INVALID"},"references":{"heading_deg":270,"altitude_ft":5000,"vs_fpm":500,"speed_kt":120},"aircraft":{"heading_deg":250,"altitude_ft":3200,"vs_fpm":450,"airspeed_kt":118},"messages":[],"pending_commands":[]}
 ```
 
 ESP32 to connector command request:
@@ -153,6 +187,7 @@ the ESP32 or an automated UART test harness:
 - `DEBUG_SET_CDI` with a value from `-127` to `127`
 - `DEBUG_SET_GSI` with a value from `-127` to `127`
 - `DEBUG_SET_SNAPSHOT` with a partial snapshot object
+- `DEBUG_SET_SIMVARS` with raw SimVar-name keys to exercise the live derivation
 - `DEBUG_CAPTURE_LATERAL`
 - `DEBUG_CAPTURE_VERTICAL`
 
@@ -176,6 +211,9 @@ python -m unittest discover -s tests -v
 
 - The baseline MSFS adapter uses generic SimVars and Key Events.
 - Generic SimVars do not expose every Garmin-style armed or captured state.
+- The generic adapter does not use the misleading `AUTOPILOT APPROACH ARM` or
+  `AUTOPILOT GLIDESLOPE ARM` values as panel armed-state annunciations.
+- Generic glideslope state can confirm LOC `GS`, but cannot prove GPS `GP`.
 - GPS approach versus GPS navigation and LOC approach versus LOC navigation may
   require GP/GS state, command history, or an aircraft-specific adapter.
 - Python-SimConnect is a third-party wrapper around the MSFS SimConnect API.

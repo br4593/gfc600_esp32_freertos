@@ -20,10 +20,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--mode",
         choices=("auto", "msfs", "debug"),
-        default="auto",
+        default=None,
         help=(
             "data source. auto: control MSFS when the sim is running, else "
-            "fall back to debug. msfs: require MSFS. debug: never use MSFS."
+            "fall back to debug. msfs: require MSFS. debug: never use MSFS. "
+            "When omitted in a terminal, the connector asks."
         ),
     )
     parser.add_argument(
@@ -35,6 +36,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--port", help="serial port, for example COM5")
     parser.add_argument("--baudrate", type=int, default=115200)
     parser.add_argument("--update-hz", type=float, default=10.0)
+    parser.add_argument(
+        "--source-open-timeout",
+        type=float,
+        default=5.0,
+        help="seconds to wait for SimConnect/source startup before failing",
+    )
     parser.add_argument(
         "--web",
         action="store_true",
@@ -68,6 +75,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.list_ports:
         return list_ports()
 
+    args.mode = args.mode or "debug" if args.web else resolve_mode(args.mode)
+
+    if not args.web and args.transport == "serial" and not args.port:
+        args.port = resolve_serial_port()
+
     source = build_source(args.mode)
 
     if args.web:
@@ -76,6 +88,15 @@ def main(argv: list[str] | None = None) -> int:
             source=source,
             transport=transport,
             update_hz=args.update_hz,
+            source_factories={
+                "auto": lambda: AutoSource(),
+                "msfs": lambda: MsfsSource(),
+                "debug": lambda: DebugSource(),
+            },
+            selected_mode=args.mode,
+            transport_factory=lambda port, baudrate: SerialTransport(port, baudrate),
+            selected_port=args.port,
+            baudrate=args.baudrate,
         )
         return run_web_server(app, args.web_host, args.web_port)
 
@@ -89,6 +110,7 @@ def main(argv: list[str] | None = None) -> int:
         transport=transport,
         update_hz=args.update_hz,
         snapshot_count=args.snapshot_count,
+        source_open_timeout_s=args.source_open_timeout,
     )
     try:
         connector.run()
@@ -102,20 +124,83 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def list_ports() -> int:
-    try:
-        from serial.tools import list_ports as serial_list_ports
-    except ImportError:
-        print("pyserial is required to list serial ports", file=sys.stderr)
+    ports = available_serial_ports()
+    if ports is None:
         return 1
-
-    ports = list(serial_list_ports.comports())
     if not ports:
         print("No serial ports found.")
         return 0
 
-    for port in ports:
-        print(f"{port.device}: {port.description}")
+    for device, description in ports:
+        print(f"{device}: {description}")
     return 0
+
+
+def available_serial_ports() -> list[tuple[str, str]] | None:
+    try:
+        from serial.tools import list_ports as serial_list_ports
+    except ImportError:
+        print("pyserial is required to list serial ports", file=sys.stderr)
+        return None
+
+    return [(port.device, port.description) for port in serial_list_ports.comports()]
+
+
+def resolve_mode(mode: str | None) -> str:
+    if mode is not None:
+        return mode
+    if not sys.stdin.isatty():
+        return "auto"
+
+    print("Select connector mode:")
+    print("  1. Debug - simulated data, MSFS not required")
+    print("  2. MSFS  - connect to and control MSFS")
+
+    while True:
+        try:
+            choice = input("Mode [1]: ").strip().lower()
+        except EOFError:
+            return "debug"
+
+        if choice in {"", "1", "debug", "d"}:
+            return "debug"
+        if choice in {"2", "msfs", "m"}:
+            return "msfs"
+        print("Enter 1 for Debug or 2 for MSFS.")
+
+
+def resolve_serial_port() -> str | None:
+    if not sys.stdin.isatty():
+        return None
+
+    ports = available_serial_ports()
+    if ports is None:
+        return None
+
+    if ports:
+        print("Select ESP32 serial port:")
+        for index, (device, description) in enumerate(ports, start=1):
+            print(f"  {index}. {device} - {description}")
+        prompt = f"Port [1 - {ports[0][0]}]: "
+    else:
+        print("No serial ports detected. Enter the ESP32 port manually.")
+        prompt = "Port: "
+
+    while True:
+        try:
+            choice = input(prompt).strip()
+        except EOFError:
+            return None
+
+        if ports and choice == "":
+            return ports[0][0]
+        if choice.isdigit() and ports:
+            index = int(choice) - 1
+            if 0 <= index < len(ports):
+                return ports[index][0]
+        if choice:
+            return choice
+        print("A serial port is required.")
 
 
 def build_source(mode: str) -> SnapshotSource:

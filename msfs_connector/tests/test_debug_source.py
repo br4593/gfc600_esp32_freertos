@@ -2,6 +2,7 @@ import unittest
 
 from gmc605_connector.debug_source import DebugSource
 from gmc605_connector.model import Command
+from gmc605_connector.msfs_source import derive_snapshot
 
 
 class DebugSourceTests(unittest.TestCase):
@@ -96,6 +97,88 @@ class DebugSourceTests(unittest.TestCase):
         self.assertEqual(snapshot.cdi.needle, 80)
         self.assertEqual(snapshot.gsi.needle, -45)
         self.assertEqual(snapshot.messages, ["no sim", "trim"])
+
+    def test_debug_set_snapshot_is_atomic_when_validation_fails(self) -> None:
+        result = self.source.handle_command(
+            Command(
+                seq=1,
+                command="DEBUG_SET_SNAPSHOT",
+                value={"ap": True, "lat_active": "BAD_MODE"},
+            )
+        )
+
+        self.assertFalse(result.accepted)
+        snapshot = self.source.poll()
+        self.assertFalse(snapshot.ap)
+        self.assertEqual(snapshot.lat_active, "NONE")
+
+    def test_debug_snapshot_enforces_live_output_invariants(self) -> None:
+        self.command(
+            "DEBUG_SET_SNAPSHOT",
+            {
+                "ap": True,
+                "fd": False,
+                "lat_active": "HDG",
+                "vert_active": "VS",
+            },
+        )
+        snapshot = self.source.poll()
+        self.assertTrue(snapshot.fd)
+        self.assertEqual(snapshot.lat_active, "HDG")
+
+        self.command(
+            "DEBUG_SET_SNAPSHOT",
+            {"ap": False, "fd": True, "lat_active": "NONE", "vert_active": "NONE"},
+        )
+        snapshot = self.source.poll()
+        self.assertEqual(snapshot.lat_active, "ROL")
+        self.assertEqual(snapshot.vert_active, "PIT")
+
+        self.command("DEBUG_SET_SNAPSHOT", {"ap": False, "fd": False})
+        snapshot = self.source.poll()
+        self.assertEqual(snapshot.lat_active, "NONE")
+        self.assertEqual(snapshot.vert_active, "NONE")
+        self.assertEqual(snapshot.vert_armed, [])
+
+    def test_debug_poll_returns_an_independent_snapshot(self) -> None:
+        snapshot = self.source.poll()
+        snapshot.ap = True
+        self.assertFalse(self.source.poll().ap)
+
+    def test_debug_rejects_non_numeric_reference_without_changing_it(self) -> None:
+        result = self.source.handle_command(
+            Command(seq=1, command="ALTITUDE_SET", value="6000")
+        )
+        self.assertFalse(result.accepted)
+        self.assertEqual(self.source.poll().references.altitude_ft, 5000)
+
+    def test_debug_and_msfs_snapshots_have_the_same_output_shape(self) -> None:
+        debug_message = self.source.poll().to_message()
+        msfs_message = derive_snapshot({}).to_message()
+
+        self.assertEqual(set(debug_message), set(msfs_message))
+        for field in ("cdi", "gsi", "references", "aircraft"):
+            self.assertEqual(set(debug_message[field]), set(msfs_message[field]))
+
+    def test_debug_can_simulate_exact_generic_msfs_derivation(self) -> None:
+        values = {
+            "AUTOPILOT_MASTER": 1,
+            "AUTOPILOT_HEADING_LOCK": 1,
+            "AUTOPILOT_ALTITUDE_LOCK": 1,
+            "AUTOPILOT_HEADING_LOCK_DIR": 275,
+        }
+        expected = derive_snapshot(values)
+
+        self.command("DEBUG_SET_SIMVARS", values)
+        actual = self.source.poll()
+
+        self.assertEqual(actual.ap, expected.ap)
+        self.assertEqual(actual.fd, expected.fd)
+        self.assertEqual(actual.lat_active, expected.lat_active)
+        self.assertEqual(actual.vert_active, expected.vert_active)
+        self.assertEqual(actual.references, expected.references)
+        self.assertEqual(actual.source, "debug")
+        self.assertEqual(actual.messages, ["DEBUG SIMVARS"])
 
 
 if __name__ == "__main__":

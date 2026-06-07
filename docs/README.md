@@ -1,44 +1,45 @@
-# Project Documentation
+# GFC 600 MSFS Panel Documentation
 
-This is an MSFS-only Garmin GMC 605 / GFC 600-style simulator panel.
+This project is an MSFS-only physical GMC 605-style panel. It is not intended
+for real aircraft or certified use.
 
-The new project rule is simple:
+## Read In This Order
 
-- MSFS owns autopilot behavior.
-- The Python connector talks to MSFS through SimConnect.
-- The ESP32 shows the latest connector snapshot on the OLED.
-- The ESP32 sends button and encoder commands back to the connector.
-- The ESP32 does not implement autopilot mode logic.
-
-## Current Core Documents
-
-| Document | Purpose |
+| Document | One clear purpose |
 |---|---|
-| [Firmware Architecture](design-decisions/gmc605-firmware-architecture.md) | ESP32 display/input firmware shape and task ownership. |
-| [MSFS Connector Web GUI](design-decisions/msfs-connector-web-gui.md) | Planned browser GUI for the Python connector. |
-| [MSFS SimVar And Event Map](research/msfs-gmc605-simvar-event-map.md) | Minimal SimConnect reads, events, and adapter rules. |
-| [Display Annunciation Model](state-machines/gfc600-mode-logic.md) | Display labels and snapshot fields, not firmware-owned AP logic. |
-| [Display And ESP32 Selection](design-decisions/gmc605-display-and-esp32-selection.md) | Hardware/display decision for the simulator panel. |
-| [Panel Integration Test Plan](test-plans/gfc600-mode-logic-test-plan.md) | Tests for connector, ESP32 display, and command flow. |
-| [MSFS Connector README](../msfs_connector/README.md) | Existing Python connector notes and runnable details. |
+| [GFC600_LOGIC.md](GFC600_LOGIC.md) | Defines the real GFC 600 modes, transitions, and annunciations we want to mimic. |
+| [MSFS_MAPPING.md](MSFS_MAPPING.md) | Maps generic MSFS SimVars into canonical GFC 600 modes and marks uncertain mappings. |
+| [PROJECT_PLAN.md](PROJECT_PLAN.md) | Defines system ownership, implementation phases, and validation scenarios. |
+| [ESP32 Connector Output Protocol](workflows/esp32-connector-output-protocol.md) | Defines the current UART/JSON output for ESP32 parser and renderer implementation. |
 
-## Editing Rules
+`GFC600_LOGIC.md` is the behavioral source of truth. `MSFS_MAPPING.md` explains
+how much of that behavior MSFS can prove. `PROJECT_PLAN.md` defines how to build
+and test the connector without mixing those two concerns.
 
-- Keep firmware docs about ESP32 inputs, display, link health, and rendering.
-- Keep SimConnect details in the SimVar/event map.
-- Keep connector UI decisions in the web GUI document.
-- Keep display label decisions in the annunciation model.
-- Do not add Garmin-style transition engines to ESP32 documentation.
-- Do not describe this as real aircraft avionics.
+## System Rule
 
-## First Restart Target
+```text
+MSFS aircraft state
+  -> Python connector maps it into canonical GFC 600-style state
+  -> Web GUI and future ESP32 render the connector snapshot
+```
 
-Build a working loop before adding polish:
+MSFS owns actual flight-control behavior. The connector owns interpretation and
+aircraft-specific mapping. The ESP32 will eventually own physical inputs and
+rendering only.
 
-1. Python connector reads MSFS state.
-2. Python connector sends a compact snapshot to ESP32.
-3. ESP32 displays AP/FD/YD key LEDs, lateral/vertical LCD labels, references,
-   and link status.
-4. ESP32 sends button/encoder commands to Python.
-5. Python sends SimConnect events to MSFS.
-6. Python reads back the result and sends the next snapshot.
+## Modeling Principle
+
+The canonical AFCS state is not one mode enum. It contains parallel engagement,
+lateral, vertical, protection, and attention regions. This allows valid states
+such as `HDG` active with `GPS` armed while `VS` is active with both `ALTS` and
+`GP` armed.
+
+## Primary Sources
+
+- Garmin GFC 600 Pilot's Guide, `190-01488-00 Rev. H`:
+  https://static.garmin.com/pumac/190-01488-00_h.pdf
+- MSFS Aircraft Autopilot/Assistant Variables:
+  https://docs.flightsimulator.com/html/Programming_Tools/SimVars/Aircraft_SimVars/Aircraft_AutopilotAssistant_Variables.htm
+- MSFS Aircraft Autopilot/Flight Assist Events:
+  https://docs.flightsimulator.com/html/Programming_Tools/Event_IDs/Aircraft_Autopilot_Flight_Assist_Events.htm

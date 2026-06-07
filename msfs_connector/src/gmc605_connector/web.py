@@ -8,9 +8,11 @@ from dataclasses import asdict
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any
 from urllib.parse import urlparse
 
+from .connector import close_with_timeout
 from .model import Command, CommandResult, PanelSnapshot
 from .protocol import ProtocolError, error_message, hello_message, parse_command
 from .source import SnapshotSource
@@ -54,6 +56,7 @@ DEBUG_COMMANDS = (
     "DEBUG_SET_CDI",
     "DEBUG_SET_GSI",
     "DEBUG_SET_SNAPSHOT",
+    "DEBUG_SET_SIMVARS",
     "DEBUG_CAPTURE_LATERAL",
     "DEBUG_CAPTURE_VERTICAL",
 )
@@ -65,11 +68,23 @@ class WebConnectorApp:
         source: SnapshotSource,
         transport: Transport | None = None,
         update_hz: float = 10.0,
+        source_factories: dict[str, Callable[[], SnapshotSource]] | None = None,
+        selected_mode: str | None = None,
+        transport_factory: Callable[[str, int], Transport] | None = None,
+        selected_port: str | None = None,
+        baudrate: int = 115200,
     ) -> None:
         if update_hz <= 0:
             raise ValueError("update_hz must be greater than zero")
         self._source = source
+        self._source_factories = source_factories or {}
+        self._selected_mode = selected_mode or source.name
+        self._pending_source: tuple[str, SnapshotSource] | None = None
         self._transport = transport
+        self._transport_factory = transport_factory
+        self._selected_port = selected_port
+        self._baudrate = baudrate
+        self._pending_transport: tuple[Transport | None, str | None, int] | None = None
         self._update_hz = update_hz
         self._period_s = 1.0 / update_hz
         self._lock = threading.RLock()
@@ -83,6 +98,8 @@ class WebConnectorApp:
         self._last_result: dict[str, Any] | None = None
         self._last_error = ""
         self._log: list[str] = []
+        self._uart_rx: list[str] = []
+        self._uart_tx: list[str] = []
 
     @property
     def source_name(self) -> str:
@@ -98,9 +115,6 @@ class WebConnectorApp:
                 return
             self._running = True
 
-        self._try_open_source()
-        self._try_open_transport()
-
         self._thread = threading.Thread(
             target=self._run_loop,
             name="gmc605-web-connector",
@@ -112,30 +126,83 @@ class WebConnectorApp:
         with self._lock:
             self._running = False
         if self._thread is not None:
-            self._thread.join(timeout=2.0)
-            self._thread = None
+            self._thread.join(timeout=0.2)
         self._close_source()
         self._close_transport()
+        if self._thread is not None:
+            self._thread.join(timeout=0.5)
+            self._thread = None
 
     def status(self) -> dict[str, Any]:
         with self._lock:
             return {
                 "running": self._running,
                 "source": self._source.name,
+                "mode": self._selected_mode,
+                "available_modes": list(self._source_factories),
                 "source_open": self._source_open,
                 "transport_enabled": self._transport is not None,
                 "transport_open": self._transport_open,
+                "transport_port": self._selected_port,
+                "baudrate": self._baudrate,
                 "update_hz": self._update_hz,
                 "last_error": self._last_error,
                 "snapshot": self._last_snapshot,
                 "last_result": self._last_result,
                 "log": list(self._log[-12:]),
+                "uart_rx": list(self._uart_rx[-100:]),
+                "uart_tx": list(self._uart_tx[-100:]),
                 "commands": {
                     "panel": list(PANEL_COMMANDS),
                     "reference": list(REFERENCE_COMMANDS),
                     "debug": list(DEBUG_COMMANDS),
                 },
             }
+
+    def select_mode(self, mode: str) -> dict[str, Any]:
+        normalized = mode.strip().lower()
+        factory = self._source_factories.get(normalized)
+        if factory is None:
+            raise ValueError(f"unsupported mode: {mode}")
+        replacement = factory()
+        with self._lock:
+            self._pending_source = (normalized, replacement)
+            self._selected_mode = normalized
+            self._last_error = ""
+            self._log.append(f"switching to {normalized} source")
+        return self.status()
+
+    def clear_uart_rx(self) -> dict[str, Any]:
+        with self._lock:
+            self._uart_rx.clear()
+        return self.status()
+
+    def clear_uart_tx(self) -> dict[str, Any]:
+        with self._lock:
+            self._uart_tx.clear()
+        return self.status()
+
+    def configure_uart(self, port: str | None, baudrate: int = 115200) -> dict[str, Any]:
+        if isinstance(baudrate, bool) or not isinstance(baudrate, int) or baudrate <= 0:
+            raise ValueError("baudrate must be a positive integer")
+
+        normalized_port = port.strip() if isinstance(port, str) else ""
+        if normalized_port:
+            if self._transport_factory is None:
+                raise ValueError("UART transport selection is not available")
+            replacement = self._transport_factory(normalized_port, baudrate)
+            log_message = f"connecting UART {normalized_port} at {baudrate} baud"
+            selected_port: str | None = normalized_port
+        else:
+            replacement = None
+            log_message = "disconnecting UART"
+            selected_port = None
+
+        with self._lock:
+            self._pending_transport = (replacement, selected_port, baudrate)
+            self._last_error = ""
+            self._log.append(log_message)
+        return self.status()
 
     def send_web_command(self, name: str, value: Any = None) -> dict[str, Any]:
         with self._lock:
@@ -162,9 +229,15 @@ class WebConnectorApp:
         while self._is_running():
             now = time.monotonic()
 
+            self._apply_pending_source()
+            if self._apply_pending_transport():
+                next_transport_retry = now
+
             if not self._source_open and now >= next_source_retry:
                 self._try_open_source()
                 next_source_retry = now + 2.0
+                if not self._is_running():
+                    break
 
             if (
                 self._transport is not None
@@ -183,6 +256,41 @@ class WebConnectorApp:
 
             time.sleep(min(0.02, max(0.0, next_snapshot - time.monotonic())))
 
+    def _apply_pending_source(self) -> None:
+        with self._lock:
+            pending = self._pending_source
+            self._pending_source = None
+        if pending is None:
+            return
+
+        mode, replacement = pending
+        self._close_source()
+        with self._lock:
+            self._source = replacement
+            self._source_open = False
+            self._last_snapshot = None
+        self._record_log(f"{mode} source selected")
+
+    def _apply_pending_transport(self) -> bool:
+        with self._lock:
+            pending = self._pending_transport
+            self._pending_transport = None
+        if pending is None:
+            return False
+
+        replacement, port, baudrate = pending
+        self._close_transport()
+        with self._lock:
+            self._transport = replacement
+            self._selected_port = port
+            self._baudrate = baudrate
+            self._transport_open = False
+        if port is None:
+            self._record_log("UART disconnected")
+        else:
+            self._record_log(f"UART {port} selected")
+        return True
+
     def _is_running(self) -> bool:
         with self._lock:
             return self._running
@@ -195,6 +303,13 @@ class WebConnectorApp:
             self._source.open()
         except Exception as exc:
             self._record_error(f"source open failed: {exc}")
+            return
+        if not self._is_running():
+            close_with_timeout(
+                self._source.close,
+                0.5,
+                f"{self._source.name} source after stopped open",
+            )
             return
         with self._lock:
             self._source_open = True
@@ -209,7 +324,9 @@ class WebConnectorApp:
                 return
         try:
             self._transport.open()
-            self._transport.send(hello_message(self._source.name, self._update_hz))
+            hello = hello_message(self._source.name, self._update_hz)
+            self._transport.send(hello)
+            self._record_uart_tx(hello)
         except Exception as exc:
             self._record_error(f"transport open failed: {exc}")
             self._close_transport()
@@ -220,20 +337,14 @@ class WebConnectorApp:
         self._record_log("transport opened")
 
     def _close_source(self) -> None:
-        try:
-            self._source.close()
-        except Exception:
-            LOGGER.debug("source close failed", exc_info=True)
+        close_with_timeout(self._source.close, 0.5, f"{self._source.name} source")
         with self._lock:
             self._source_open = False
 
     def _close_transport(self) -> None:
         if self._transport is None:
             return
-        try:
-            self._transport.close()
-        except Exception:
-            LOGGER.debug("transport close failed", exc_info=True)
+        close_with_timeout(self._transport.close, 0.5, "transport")
         with self._lock:
             self._transport_open = False
 
@@ -248,6 +359,15 @@ class WebConnectorApp:
             return
 
         for message in messages:
+            raw = message.get("_raw")
+            if not isinstance(raw, str):
+                raw = message.get("raw")
+            if not isinstance(raw, str):
+                raw = json.dumps(message, separators=(",", ":"), ensure_ascii=True)
+            with self._lock:
+                self._uart_rx.append(raw)
+            if message.get("type") == "_transport_raw":
+                continue
             if message.get("type") == "_transport_error":
                 self._send_to_transport(error_message(str(message.get("message", ""))))
                 continue
@@ -324,9 +444,15 @@ class WebConnectorApp:
             return
         try:
             self._transport.send(message)
+            self._record_uart_tx(message)
         except Exception as exc:
             self._record_error(f"transport send failed: {exc}")
             self._close_transport()
+
+    def _record_uart_tx(self, message: dict[str, Any]) -> None:
+        text = json.dumps(message, separators=(",", ":"), ensure_ascii=True)
+        with self._lock:
+            self._uart_tx.append(text)
 
     def _record_error(self, message: str) -> None:
         LOGGER.warning(message)
@@ -365,7 +491,7 @@ def build_handler(app: WebConnectorApp) -> type[BaseHTTPRequestHandler]:
                 self._send_json(app.status())
                 return
             if path == "/api/ports":
-                self._send_json({"ports": list_serial_ports()})
+                self._send_json(serial_port_status())
                 return
             if path == "/assets/gmc605_panel.svg":
                 self._send_file(PANEL_IMAGE_PATH, "image/svg+xml")
@@ -377,6 +503,37 @@ def build_handler(app: WebConnectorApp) -> type[BaseHTTPRequestHandler]:
 
         def do_POST(self) -> None:
             path = urlparse(self.path).path
+            if path == "/api/mode":
+                try:
+                    payload = self._read_json()
+                    mode = payload["mode"]
+                    if not isinstance(mode, str) or not mode.strip():
+                        raise ValueError("mode is required")
+                    self._send_json(app.select_mode(mode))
+                except Exception as exc:
+                    self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                return
+
+            if path == "/api/transport":
+                try:
+                    payload = self._read_json()
+                    port = payload.get("port")
+                    baudrate = payload.get("baudrate", 115200)
+                    if port is not None and not isinstance(port, str):
+                        raise ValueError("port must be a string or null")
+                    self._send_json(app.configure_uart(port, baudrate))
+                except Exception as exc:
+                    self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                return
+
+            if path == "/api/uart-rx/clear":
+                self._send_json(app.clear_uart_rx())
+                return
+
+            if path == "/api/uart-tx/clear":
+                self._send_json(app.clear_uart_tx())
+                return
+
             if path != "/api/command":
                 self.send_error(HTTPStatus.NOT_FOUND, "not found")
                 return
@@ -442,14 +599,24 @@ def build_handler(app: WebConnectorApp) -> type[BaseHTTPRequestHandler]:
 
 
 def list_serial_ports() -> list[dict[str, str]]:
+    return serial_port_status()["ports"]
+
+
+def serial_port_status() -> dict[str, Any]:
     try:
         from serial.tools import list_ports as serial_list_ports
     except ImportError:
-        return []
-    return [
-        {"device": port.device, "description": port.description}
-        for port in serial_list_ports.comports()
-    ]
+        return {
+            "ports": [],
+            "error": "pyserial is not installed in the Python environment running the GUI",
+        }
+    return {
+        "ports": [
+            {"device": port.device, "description": port.description}
+            for port in serial_list_ports.comports()
+        ],
+        "error": "",
+    }
 
 
 INDEX_HTML = r"""<!doctype html>
@@ -792,6 +959,46 @@ INDEX_HTML = r"""<!doctype html>
     <!-- ============ RIGHT RAIL ============ -->
     <div>
       <section>
+        <h2>Connector Source</h2>
+        <label class="field">
+          <span>Select mode</span>
+          <select id="mode-control">
+            <option value="debug">Debug</option>
+            <option value="msfs">MSFS</option>
+            <option value="auto">Auto</option>
+          </select>
+        </label>
+        <p class="muted" style="margin-bottom:0;font-size:12px">
+          Debug uses simulated data. MSFS connects to SimConnect. Auto tries MSFS and falls back to Debug.
+        </p>
+        <div class="sub-block">
+          <h3>ESP32 UART</h3>
+          <div class="control-grid">
+            <label class="field">
+              <span>Detected ports</span>
+              <select id="uart-port-list">
+                <option value="">Refresh to detect ports</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>Serial port / manual entry</span>
+              <input id="uart-port-control" placeholder="COM5 or /dev/ttyUSB0">
+            </label>
+            <label class="field">
+              <span>Baudrate</span>
+              <input id="uart-baudrate-control" type="number" min="1" step="1" value="115200">
+            </label>
+          </div>
+          <div class="actions">
+            <button id="uart-refresh" data-always-enabled>Refresh Ports</button>
+            <button id="uart-connect" class="primary" data-always-enabled>Connect UART</button>
+            <button id="uart-disconnect" class="warn" data-always-enabled>Disconnect UART</button>
+          </div>
+          <p id="uart-status" class="muted" style="margin-bottom:0;font-size:12px">No UART selected.</p>
+          <p id="uart-port-error" class="muted" style="margin-bottom:0;font-size:12px"></p>
+        </div>
+      </section>
+      <section>
         <h2>Live State</h2>
         <div class="side-grid">
           <div class="metric"><div class="label">AP</div><div id="ap" class="value">--</div></div>
@@ -809,6 +1016,26 @@ INDEX_HTML = r"""<!doctype html>
       <section>
         <h2>Connector Log</h2>
         <div id="log" class="log"></div>
+      </section>
+      <section>
+        <div class="panel-head">
+          <h2 style="margin:0">ESP32 Prints / UART RX</h2>
+          <button id="uart-rx-clear" data-always-enabled>Clear</button>
+        </div>
+        <p class="muted" style="margin-top:0;font-size:12px">
+          Raw lines printed or transmitted by the ESP32 to the connector.
+        </p>
+        <pre id="uart-rx">No ESP32 output received.</pre>
+      </section>
+      <section>
+        <div class="panel-head">
+          <h2 style="margin:0">ESP32 Receives / UART TX</h2>
+          <button id="uart-tx-clear" data-always-enabled>Clear</button>
+        </div>
+        <p class="muted" style="margin-top:0;font-size:12px">
+          JSON lines sent by the connector for the ESP32 to receive.
+        </p>
+        <pre id="uart-tx">No messages sent to ESP32.</pre>
       </section>
       <section>
         <h2>Raw Snapshot</h2>
@@ -836,6 +1063,16 @@ INDEX_HTML = r"""<!doctype html>
       fillSelect("lat-active-control", lateralModes);
       fillSelect("lat-armed-control", lateralModes);
       fillSelect("vert-active-control", verticalModes);
+      $("mode-control").addEventListener("change", () => selectMode($("mode-control").value));
+      $("uart-refresh").addEventListener("click", refreshPorts);
+      $("uart-port-list").addEventListener("change", () => {
+        if ($("uart-port-list").value) $("uart-port-control").value = $("uart-port-list").value;
+      });
+      $("uart-connect").addEventListener("click", () => configureUart($("uart-port-control").value));
+      $("uart-disconnect").addEventListener("click", () => configureUart(null));
+      $("uart-rx-clear").addEventListener("click", clearUartRx);
+      $("uart-tx-clear").addEventListener("click", clearUartTx);
+      refreshPorts();
 
       document.querySelectorAll("[data-command]").forEach((button) => {
         button.addEventListener("click", () => sendCommand(button.dataset.command));
@@ -880,6 +1117,53 @@ INDEX_HTML = r"""<!doctype html>
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body)
       });
+      await refresh();
+    }
+
+    async function selectMode(mode) {
+      await fetch("/api/mode", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode })
+      });
+      await refresh();
+    }
+
+    async function configureUart(port) {
+      await fetch("/api/transport", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ port, baudrate: Number($("uart-baudrate-control").value || 115200) })
+      });
+      await refresh();
+    }
+
+    async function refreshPorts() {
+      const response = await fetch("/api/ports", { cache: "no-store" });
+      const payload = await response.json();
+      const ports = payload.ports || [];
+      const placeholder = document.createElement("option");
+      placeholder.value = "";
+      placeholder.textContent = ports.length ? `Select a detected port (${ports.length})` : "No serial ports detected";
+      $("uart-port-list").replaceChildren(placeholder, ...ports.map((port) => {
+        const option = document.createElement("option");
+        option.value = port.device;
+        option.textContent = `${port.device} - ${port.description}`;
+        return option;
+      }));
+      if (lastStatus && lastStatus.transport_port && ports.some((port) => port.device === lastStatus.transport_port)) {
+        $("uart-port-list").value = lastStatus.transport_port;
+      }
+      $("uart-port-error").textContent = payload.error || "";
+    }
+
+    async function clearUartRx() {
+      await fetch("/api/uart-rx/clear", { method: "POST" });
+      await refresh();
+    }
+
+    async function clearUartTx() {
+      await fetch("/api/uart-tx/clear", { method: "POST" });
       await refresh();
     }
 
@@ -1077,10 +1361,17 @@ INDEX_HTML = r"""<!doctype html>
       createControls();
       const s = status.snapshot;
       setPill("source-pill", status.source_open, `${status.source.toUpperCase()} source`);
+      setValue("mode-control", status.mode);
       setPill("transport-pill", status.transport_open, status.transport_enabled ? "UART transport" : "No UART", !status.transport_enabled);
       setPill("rate-pill", true, `${status.update_hz} Hz`);
+      if (status.transport_port) setValue("uart-port-control", status.transport_port);
+      if (status.transport_port) setValue("uart-port-list", status.transport_port);
+      setValue("uart-baudrate-control", status.baudrate);
+      $("uart-status").textContent = status.transport_port
+        ? `${status.transport_open ? "Connected" : "Connecting"}: ${status.transport_port} at ${status.baudrate} baud`
+        : "No UART selected.";
 
-      document.querySelectorAll("button").forEach((button) => button.disabled = !status.source_open);
+      document.querySelectorAll("button:not([data-always-enabled])").forEach((button) => button.disabled = !status.source_open);
       if (!s) { $("raw").textContent = JSON.stringify(status, null, 2); return; }
 
       trackDisplayRules(s);
@@ -1136,6 +1427,8 @@ INDEX_HTML = r"""<!doctype html>
         node.textContent = line;
         return node;
       }));
+      $("uart-rx").textContent = status.uart_rx.length ? status.uart_rx.join("\n") : "No ESP32 output received.";
+      $("uart-tx").textContent = status.uart_tx.length ? status.uart_tx.join("\n") : "No messages sent to ESP32.";
       $("raw").textContent = JSON.stringify(s, null, 2);
     }
 

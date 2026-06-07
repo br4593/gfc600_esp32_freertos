@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import copy
+import math
+
 from .model import (
     AircraftData,
     Command,
@@ -8,8 +11,6 @@ from .model import (
     PanelSnapshot,
     References,
     normalize_heading,
-    to_bool,
-    to_int,
 )
 from .source import SnapshotSource
 
@@ -37,7 +38,7 @@ class DebugSource(SnapshotSource):
         return None
 
     def poll(self) -> PanelSnapshot:
-        return self._snapshot
+        return copy.deepcopy(self._snapshot)
 
     def handle_command(self, command: Command) -> CommandResult:
         handler = getattr(self, f"_command_{command.command.lower()}", None)
@@ -54,7 +55,7 @@ class DebugSource(SnapshotSource):
         return PanelSnapshot(
             source=self.name,
             sim_connected=True,
-            cdi=Deviation.from_needle(True, 0),
+            cdi=Deviation.from_needle(False, 0),
             gsi=Deviation.from_needle(False, 0),
             references=References(
                 heading_deg=90,
@@ -140,19 +141,34 @@ class DebugSource(SnapshotSource):
         self._snapshot = self._default_snapshot()
 
     def _command_debug_set_nav_source(self, value: object) -> None:
-        source = str(value).upper()
-        if source not in self._NAV_SOURCES:
-            raise ValueError("nav source must be NONE, GPS, VOR, or LOC")
+        source = self._mode_value(value, self._NAV_SOURCES, "nav source")
         self._snapshot.nav_source = source
 
     def _command_debug_set_snapshot(self, value: object) -> None:
         if not isinstance(value, dict):
             raise ValueError("snapshot override value must be an object")
 
-        snapshot = self._snapshot
+        snapshot = copy.deepcopy(self._snapshot)
+        self._apply_snapshot_override(snapshot, value)
+        self._normalize_snapshot(snapshot)
+        self._snapshot = snapshot
+
+    def _command_debug_set_simvars(self, value: object) -> None:
+        if not isinstance(value, dict):
+            raise ValueError("SimVar value must be an object")
+        from .msfs_source import derive_snapshot
+
+        snapshot = derive_snapshot(value)
+        snapshot.source = self.name
+        snapshot.messages = ["DEBUG SIMVARS"]
+        self._snapshot = snapshot
+
+    def _apply_snapshot_override(
+        self, snapshot: PanelSnapshot, value: dict[str, object]
+    ) -> None:
         for name in ("sim_connected", "ap", "fd", "yd"):
             if name in value:
-                setattr(snapshot, name, to_bool(value[name]))
+                setattr(snapshot, name, self._bool_value(value[name], name))
 
         if "lat_active" in value:
             snapshot.lat_active = self._mode_value(
@@ -176,7 +192,7 @@ class DebugSource(SnapshotSource):
                     self._VERTICAL_ARMED_MODES | {"NONE"},
                     "vert_armed",
                 )
-                if armed_mode != "NONE":
+                if armed_mode != "NONE" and armed_mode not in snapshot.vert_armed:
                     snapshot.vert_armed.append(armed_mode)
         if "nav_source" in value:
             snapshot.nav_source = self._mode_value(
@@ -189,57 +205,112 @@ class DebugSource(SnapshotSource):
             snapshot.gsi = self._deviation_value(value["gsi"], "gsi")
 
         references = value.get("references")
+        if "references" in value and not isinstance(references, dict):
+            raise ValueError("references must be an object")
         if isinstance(references, dict):
             if "heading_deg" in references:
-                snapshot.references.heading_deg = normalize_heading(references["heading_deg"])
+                snapshot.references.heading_deg = normalize_heading(
+                    self._int_value(references["heading_deg"], "references.heading_deg")
+                )
             if "altitude_ft" in references:
-                snapshot.references.altitude_ft = to_int(references["altitude_ft"])
+                snapshot.references.altitude_ft = self._int_value(
+                    references["altitude_ft"], "references.altitude_ft"
+                )
             if "vs_fpm" in references:
-                snapshot.references.vs_fpm = to_int(references["vs_fpm"])
+                snapshot.references.vs_fpm = self._int_value(
+                    references["vs_fpm"], "references.vs_fpm"
+                )
             if "speed_kt" in references:
-                snapshot.references.speed_kt = max(0, to_int(references["speed_kt"]))
+                snapshot.references.speed_kt = max(
+                    0, self._int_value(references["speed_kt"], "references.speed_kt")
+                )
 
         aircraft = value.get("aircraft")
+        if "aircraft" in value and not isinstance(aircraft, dict):
+            raise ValueError("aircraft must be an object")
         if isinstance(aircraft, dict):
             if "heading_deg" in aircraft:
-                snapshot.aircraft.heading_deg = normalize_heading(aircraft["heading_deg"])
+                snapshot.aircraft.heading_deg = normalize_heading(
+                    self._int_value(aircraft["heading_deg"], "aircraft.heading_deg")
+                )
             if "altitude_ft" in aircraft:
-                snapshot.aircraft.altitude_ft = to_int(aircraft["altitude_ft"])
+                snapshot.aircraft.altitude_ft = self._int_value(
+                    aircraft["altitude_ft"], "aircraft.altitude_ft"
+                )
             if "vs_fpm" in aircraft:
-                snapshot.aircraft.vs_fpm = to_int(aircraft["vs_fpm"])
+                snapshot.aircraft.vs_fpm = self._int_value(
+                    aircraft["vs_fpm"], "aircraft.vs_fpm"
+                )
             if "airspeed_kt" in aircraft:
-                snapshot.aircraft.airspeed_kt = max(0, to_int(aircraft["airspeed_kt"]))
+                snapshot.aircraft.airspeed_kt = max(
+                    0, self._int_value(aircraft["airspeed_kt"], "aircraft.airspeed_kt")
+                )
 
         if "messages" in value:
-            if not isinstance(value["messages"], list):
-                raise ValueError("messages must be a list")
-            snapshot.messages = [str(message)[:32] for message in value["messages"][:4]]
+            snapshot.messages = self._string_list(value["messages"], "messages", 4)
         if "pending_commands" in value:
-            if not isinstance(value["pending_commands"], list):
-                raise ValueError("pending_commands must be a list")
-            snapshot.pending_commands = [
-                str(command)[:32] for command in value["pending_commands"][:8]
-            ]
+            snapshot.pending_commands = self._string_list(
+                value["pending_commands"], "pending_commands", 8
+            )
 
     def _mode_value(self, value: object, allowed: set[str], field_name: str) -> str:
-        mode = str(value).upper()
+        if not isinstance(value, str):
+            raise ValueError(f"{field_name} must be a string")
+        mode = value.upper()
         if mode not in allowed:
             raise ValueError(f"{field_name} has unsupported value {mode}")
         return mode
+
+    def _bool_value(self, value: object, field_name: str) -> bool:
+        if not isinstance(value, bool):
+            raise ValueError(f"{field_name} must be a boolean")
+        return value
+
+    def _int_value(self, value: object, field_name: str) -> int:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"{field_name} must be a number")
+        if not math.isfinite(float(value)):
+            raise ValueError(f"{field_name} must be finite")
+        return int(round(float(value)))
+
+    def _string_list(self, value: object, field_name: str, limit: int) -> list[str]:
+        if not isinstance(value, list):
+            raise ValueError(f"{field_name} must be a list")
+        if not all(isinstance(item, str) for item in value):
+            raise ValueError(f"{field_name} entries must be strings")
+        return [item[:32] for item in value[:limit]]
+
+    def _normalize_snapshot(self, snapshot: PanelSnapshot) -> None:
+        if snapshot.ap:
+            snapshot.fd = True
+        if not snapshot.fd:
+            snapshot.lat_active = "NONE"
+            snapshot.lat_armed = "NONE"
+            snapshot.vert_active = "NONE"
+            snapshot.vert_armed.clear()
+            return
+        if snapshot.lat_active == "NONE":
+            snapshot.lat_active = "ROL"
+        if snapshot.vert_active == "NONE":
+            snapshot.vert_active = "PIT"
 
     def _deviation_value(self, value: object, field_name: str) -> Deviation:
         if not isinstance(value, dict):
             raise ValueError(f"{field_name} must be an object")
         return Deviation.from_needle(
-            to_bool(value.get("valid", False)),
-            to_int(value.get("needle", 0)),
+            self._bool_value(value.get("valid", False), f"{field_name}.valid"),
+            self._int_value(value.get("needle", 0), f"{field_name}.needle"),
         )
 
     def _command_debug_set_cdi(self, value: object) -> None:
-        self._snapshot.cdi = Deviation.from_needle(True, to_int(value))
+        self._snapshot.cdi = Deviation.from_needle(
+            True, self._int_value(value, "CDI needle")
+        )
 
     def _command_debug_set_gsi(self, value: object) -> None:
-        self._snapshot.gsi = Deviation.from_needle(True, to_int(value))
+        self._snapshot.gsi = Deviation.from_needle(
+            True, self._int_value(value, "GSI needle")
+        )
 
     def _command_debug_capture_lateral(self, value: object) -> None:
         snapshot = self._snapshot
@@ -371,13 +442,17 @@ class DebugSource(SnapshotSource):
         self._add_vert_armed("ALTS")
 
     def _command_heading_set(self, value: object) -> None:
-        self._snapshot.references.heading_deg = normalize_heading(to_int(value))
+        self._snapshot.references.heading_deg = normalize_heading(
+            self._int_value(value, "heading")
+        )
 
     def _command_altitude_set(self, value: object) -> None:
-        self._snapshot.references.altitude_ft = to_int(value)
+        self._snapshot.references.altitude_ft = self._int_value(value, "altitude")
 
     def _command_vs_set(self, value: object) -> None:
-        self._snapshot.references.vs_fpm = to_int(value)
+        self._snapshot.references.vs_fpm = self._int_value(value, "vertical speed")
 
     def _command_speed_set(self, value: object) -> None:
-        self._snapshot.references.speed_kt = max(0, to_int(value))
+        self._snapshot.references.speed_kt = max(
+            0, self._int_value(value, "airspeed")
+        )
