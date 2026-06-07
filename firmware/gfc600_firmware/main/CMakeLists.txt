@@ -7,5 +7,7 @@ idf_component_register(SRCS
                         "serial_connector.cpp"
                         "serial_utils.cpp"
                         "protocol_utils.cpp"
+                        "rgb_led.cpp"
+                        "led.cpp"
                         
                     INCLUDE_DIRS ".")

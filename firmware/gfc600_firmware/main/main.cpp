@@ -15,13 +15,13 @@ constexpr TickType_t DISPLAY_SNAPSHOT_TIMEOUT = pdMS_TO_TICKS(500);
 
 struct DisplaySnapshot {
     AutopilotState state;
-    TickType_t received_at;
 };
 
 AutopilotState autopilot_state;
 SerialConnector serial_connector(UART_NUM_0, GPIO_NUM_1, GPIO_NUM_3);
 char line_buffer[SerialConnector::MAX_LINE_LENGTH];
 QueueHandle_t display_snapshot_queue;
+QueueHandle_t link_snapshot_queue;
 
 void read_serial_task(void*)
 {
@@ -42,12 +42,13 @@ void read_serial_task(void*)
         const SnapshotParseResult result =
             parse_json_and_set_autopilot_state(line_buffer, autopilot_state);
 
-        // Every valid snapshot proves the link is alive, even when its state is unchanged.
         if (result != SnapshotParseResult::INVALID) {
             DisplaySnapshot snapshot;
             snapshot.state = autopilot_state;
-            snapshot.received_at = xTaskGetTickCount();
             xQueueOverwrite(display_snapshot_queue, &snapshot);
+
+            const TickType_t received_at = xTaskGetTickCount();
+            xQueueOverwrite(link_snapshot_queue, &received_at);
         }
     }
 }
@@ -57,35 +58,47 @@ void display_state_task(void*)
     DisplaySnapshot received_snapshot;
     AutopilotState displayed_state;
     bool has_displayed_state = false;
-    bool link_stale = false;
-    TickType_t last_valid_snapshot = xTaskGetTickCount();
 
     while (true) {
-        const TickType_t elapsed = xTaskGetTickCount() - last_valid_snapshot;
-        const TickType_t wait_ticks =
-            link_stale
-                ? portMAX_DELAY
-                : elapsed < DISPLAY_SNAPSHOT_TIMEOUT
-                ? DISPLAY_SNAPSHOT_TIMEOUT - elapsed
-                : 0;
-
         const BaseType_t received = xQueueReceive(
             display_snapshot_queue,
             &received_snapshot,
-            wait_ticks);
+            portMAX_DELAY);
 
         if (received == pdPASS) {
-            last_valid_snapshot = received_snapshot.received_at;
-
-            if (link_stale) {
-                print_thread_safe("Connector snapshot link recovered\n");
-                link_stale = false;
-            }
-
             if (!has_displayed_state || !(received_snapshot.state == displayed_state)) {
                 displayed_state = received_snapshot.state;
                 has_displayed_state = true;
                 print_ap_state(displayed_state);
+            }
+        }
+    }
+}
+
+void link_health_task(void*)
+{
+    TickType_t received_at = 0;
+    TickType_t last_valid_snapshot = xTaskGetTickCount();
+    bool link_stale = false;
+
+    while (true) {
+        const TickType_t elapsed = xTaskGetTickCount() - last_valid_snapshot;
+        TickType_t wait_ticks = 0;
+        if (link_stale) {
+            wait_ticks = portMAX_DELAY;
+        } else if (elapsed < DISPLAY_SNAPSHOT_TIMEOUT) {
+            wait_ticks = DISPLAY_SNAPSHOT_TIMEOUT - elapsed;
+        }
+
+        const BaseType_t received =
+            xQueueReceive(link_snapshot_queue, &received_at, wait_ticks);
+
+        if (received == pdPASS) {
+            last_valid_snapshot = received_at;
+
+            if (link_stale) {
+                print_thread_safe("Connector snapshot link recovered\n");
+                link_stale = false;
             }
         } else if (!link_stale) {
             print_thread_safe("Connector snapshot link stale: no valid snapshot for 500 ms\n");
@@ -107,8 +120,19 @@ extern "C" void app_main(void)
         return;
     }
 
+    link_snapshot_queue = xQueueCreate(1, sizeof(TickType_t));
+    if (link_snapshot_queue == nullptr) {
+        print_thread_safe("Failed to create link snapshot queue\n");
+        return;
+    }
+
     if (xTaskCreate(display_state_task, "DisplayStateTask", 3072, nullptr, 1, nullptr) != pdPASS) {
         print_thread_safe("Failed to create display state task\n");
+        return;
+    }
+
+    if (xTaskCreate(link_health_task, "LinkHealthTask", 3072, nullptr, 1, nullptr) != pdPASS) {
+        print_thread_safe("Failed to create link health task\n");
         return;
     }
 
